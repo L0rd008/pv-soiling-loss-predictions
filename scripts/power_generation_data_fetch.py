@@ -1,159 +1,143 @@
-import requests
-import time
-import os
-import csv
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
+"""Fetch daily power generation telemetry from ThingsBoard.
 
-# 1. Load environment variables
-load_dotenv()
+Pulls raw (``agg=NONE``) asset-level generation data.  The ThingsBoard key
+``energymeter_dailygeneration`` stores values in **kWh**.  This script converts
+them to SI Joules::
 
-# 2. Import Config from .env
-TB_URL = os.getenv("TB_URL")
-TOKEN = os.getenv("TB_TOKEN")
-ASSET_ID = os.getenv("TB_PLNT_ID")
-KEYS = os.getenv("TB_GEN_KEYS") 
+    joules = raw_kWh × 1000 (→ Wh) × 3600 (→ J) = raw_kWh × 3,600,000
 
-# Safety Check
-if not all([TB_URL, TOKEN, ASSET_ID, KEYS]):
-    raise ValueError("Missing required environment variables. Please check your .env file.")
+Values exceeding ``TB_GEN_MAX_J`` or negative values are treated as invalid
+and written as empty (NaN downstream).
 
-# Output and request defaults
-OUTPUT_DIR = Path(os.getenv("TB_OUTPUT_DIR", "data"))
-REQUEST_TIMEOUT_S = int(os.getenv("TB_REQUEST_TIMEOUT_S", "30"))
-MAX_GENERATION_J = float(os.getenv("TB_GEN_MAX_J", str(100000000 * 3600)))
+Usage::
 
-print(f"Connecting to: {TB_URL} for Asset: {ASSET_ID}")
+    python scripts/power_generation_data_fetch.py
 
-# Define Local Timezone Offset (+05:30 for LK Time)
-tz_offset = timezone(timedelta(hours=5, minutes=30))
+Environment variables (see ``.env.example``):
+    TB_URL, TB_TOKEN, TB_PLNT_ID, TB_GEN_KEYS
+    Optional: TB_OUTPUT_DIR, TB_REQUEST_TIMEOUT_S, TB_GEN_MAX_J,
+              TB_TZ_OFFSET, TB_START_DATE
+"""
 
-# Time Configuration
-# End time: Now
-end_ts = int(time.time() * 1000) 
+import logging
+import sys
+from datetime import datetime
 
-# Start time: 2025-01-01 00:00:00 Local Time
-start_dt = datetime(2025, 1, 1, 0, 0, 0, tzinfo=tz_offset)
-start_ts = int(start_dt.timestamp() * 1000)
+from tb_client import (
+    auth_headers,
+    get_output_dir,
+    get_request_timeout,
+    get_tz_offset,
+    get_time_range,
+    load_env,
+    require_env,
+    write_merged_csv,
+)
 
-# Aggregation set to NONE for raw data
-agg = "NONE"
-limit = 50000  # More than enough for daily records over a few years
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
-# API Endpoint
-url = f"{TB_URL}/api/plugins/telemetry/ASSET/{ASSET_ID}/values/timeseries"
-
-params = {
-    "keys": KEYS,
-    "startTs": start_ts,
-    "endTs": end_ts,
-    "agg": agg,
-    "limit": limit
+# Abbreviation map for column naming
+ABBREVIATIONS = {
+    "energymeter": "Energy Meter",
+    "dailygeneration": "Daily Generation",
 }
 
-headers = {
-    "Content-Type": "application/json",
-    "X-Authorization": f"Bearer {TOKEN}"
-}
+# Unit conversion: kWh → Joules
+KWH_TO_JOULES = 1000.0 * 3600.0  # 3,600,000
 
-try:
-    print("Fetching raw asset generation data from 2025-01-01 to now...")
-    response = requests.get(
-        url,
-        params=params,
-        headers=headers,
-        timeout=REQUEST_TIMEOUT_S,
-    )
-    
-    if response.status_code == 200:
-        data = response.json()
-        keys_list = [k.strip() for k in KEYS.split(',')]
-        merged_data = {}
-        
+
+def main() -> None:
+    load_env()
+    env = require_env("TB_URL", "TB_TOKEN", "TB_PLNT_ID", "TB_GEN_KEYS")
+
+    tz = get_tz_offset()
+    start_ts, end_ts = get_time_range(tz)
+    headers = auth_headers(env["TB_TOKEN"])
+    timeout = get_request_timeout()
+    output_dir = get_output_dir()
+    keys = env["TB_GEN_KEYS"]
+    keys_list = [k.strip() for k in keys.split(",")]
+
+    import os
+    max_gen_j = float(os.getenv("TB_GEN_MAX_J", str(100_000_000 * 3600)))
+
+    merged_data: dict = {}
+
+    # Generation uses agg=NONE (raw data), fetched in a single request
+    import requests
+
+    url = f"{env['TB_URL']}/api/plugins/telemetry/ASSET/{env['TB_PLNT_ID']}/values/timeseries"
+    params = {
+        "keys": keys,
+        "startTs": start_ts,
+        "endTs": end_ts,
+        "agg": "NONE",
+        "limit": 50_000,
+    }
+
+    try:
+        logger.info("Fetching raw generation data …")
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+
+        if resp.status_code != 200:
+            logger.error("Server returned %d: %s", resp.status_code, resp.text)
+            sys.exit(1)
+
+        data = resp.json()
+
         for key in keys_list:
-            if key in data:
-                print(f"Found {len(data[key])} raw points for {key}.")
-                for point in data[key]:
-                    ts = point['ts']
-                    
-                    try:
-                        raw_val = float(point['value'])
-                    except (ValueError, TypeError):
-                        raw_val = "" # Broken strings become NaN downstream
-                    
-                    # --- Custom AI Post-Processing ---
-                    if isinstance(raw_val, float):
-                        scaled_value = raw_val * 1000 * 3600
-                    else:
-                        scaled_value = ""
+            if key not in data:
+                logger.warning("No data for key: %s", key)
+                continue
 
-                    if isinstance(scaled_value, float) and scaled_value > MAX_GENERATION_J:
+            logger.info("Found %d raw points for %s", len(data[key]), key)
+
+            for point in data[key]:
+                ts = point["ts"]
+
+                try:
+                    raw_kwh = float(point["value"])
+                except (ValueError, TypeError):
+                    final_val: object = ""
+                else:
+                    # Convert kWh → Joules
+                    joules = raw_kwh * KWH_TO_JOULES
+
+                    if joules > max_gen_j or joules < 0:
                         final_val = ""
-                    elif isinstance(scaled_value, float) and scaled_value < 0:
-                        final_val = "" 
                     else:
-                        final_val = scaled_value
-                    
-                    if ts not in merged_data:
-                        merged_data[ts] = {}
-                    
-                    merged_data[ts][key] = final_val
-            else:
-                print(f"Warning: No data found for {key}.")
-                
-        # Export merged data to CSV
-        if merged_data:
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            filename = OUTPUT_DIR / 'power_generation_2025_to_current_1day_none_si.csv'
-            
-            with open(filename, 'w', newline='') as f:
-                writer = csv.writer(f)
-                
-                # --- Readable Column Names Logic ---
-                formatted_keys = []
-                
-                # Dictionary to fix the CamelCase key names
-                abbreviations = {
-                    "energymeter": "Energy Meter",
-                    "dailygeneration": "Daily Generation"
-                }
-                
-                for k in keys_list:
-                    # Split the key by underscores
-                    parts = k.split('_')
-                    processed_parts = []
-                    
-                    for part in parts:
-                        # If the part is in our dictionary, format it nicely
-                        if part.lower() in abbreviations:
-                            processed_parts.append(abbreviations[part.lower()])
-                        else:
-                            processed_parts.append(part.title())
-                            
-                    readable_name = " ".join(processed_parts)
-                    formatted_keys.append(f"{readable_name} (J)")
-                
-                headers_row = ["Timestamp", "Date"] + formatted_keys
-                writer.writerow(headers_row)
-                
-                for ts in sorted(merged_data.keys()):
-                    dt_local = datetime.fromtimestamp(ts / 1000.0, tz=tz_offset)
-                    date_str = dt_local.strftime('%Y-%m-%d %H:%M:%S')
-                    
-                    row = [ts, date_str]
-                    
-                    for key in keys_list:
-                        row.append(merged_data[ts].get(key, ""))
-                        
-                    writer.writerow(row)
-                    
-            print(f"\nData successfully cleaned, scaled, and exported to {filename}")
-        else:
-            print("No data was processed to export.")
-            
-    else:
-        print(f"Error: {response.status_code} - {response.text}")
+                        final_val = joules
 
-except Exception as e:
-    print(f"Failed to fetch data: {e}")
+                if ts not in merged_data:
+                    merged_data[ts] = {}
+                merged_data[ts][key] = final_val
+
+    except KeyboardInterrupt:
+        logger.warning("Interrupted — saving collected data …")
+    except requests.exceptions.RequestException as exc:
+        logger.error("Request failed: %s", exc)
+        # Still try to save whatever we have
+
+    if not merged_data:
+        logger.warning("No data collected.")
+        sys.exit(1)
+
+    # Readable column headers
+    formatted_keys = []
+    for k in keys_list:
+        parts = k.split("_")
+        processed = [ABBREVIATIONS.get(p.lower(), p.title()) for p in parts]
+        formatted_keys.append(f"{' '.join(processed)} (J)")
+
+    write_merged_csv(
+        filepath=output_dir / "power_generation_2025_to_current_1day_none_si.csv",
+        merged_data=merged_data,
+        header_columns=formatted_keys,
+        key_order=keys_list,
+        tz=tz,
+    )
+
+
+if __name__ == "__main__":
+    main()
