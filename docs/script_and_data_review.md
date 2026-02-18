@@ -66,6 +66,8 @@ Reviewed files:
   - Treat invalid generation values as missing instead of forcing fixed constants.
 - Added `README.md` with stakeholder-centric objectives and workflow.
 - Added `requirements.txt` and tightened `.gitignore`.
+- Added `scripts/data_preprocess.py` for deterministic cleaning and daily model-table generation.
+- Added `docs/preprocessing_plan.md` and `docs/data_dictionary.md` updates for cross-plant inference usage.
 
 ## Recommended Next Engineering Actions
 

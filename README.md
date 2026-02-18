@@ -8,6 +8,18 @@ Current plant context:
 - Inverters in this dataset: 8 (4 from block `B1`, 4 from block `B2`)
 - Data source: ThingsBoard telemetry exports
 
+## Cross-Plant Inference Context
+
+This repository is trained and validated on one plant, but the objective is to
+use learned behavior to infer insights for plants that have not yet been fully
+analyzed.
+
+Practical implications:
+- Treat outputs as transfer-ready signals, not universal truths.
+- Always quality-gate daily records before cross-plant use.
+- Recalibrate thresholds per target plant (orientation, DC/AC ratio, clipping).
+- Separate plant-specific KPIs from generally transferable patterns.
+
 ## Stakeholder-Focused Outcomes
 
 `Control Center Operators`
@@ -58,9 +70,10 @@ Current plant context:
 ## Repository Workflow
 
 1. Fetch telemetry data from ThingsBoard using scripts in `scripts/`.
-2. Run data-quality audit + preprocessing for ML feature readiness.
-3. Use curated daily features for model training and anomaly logic.
-4. Generate stakeholder-facing KPI and alert outputs.
+2. Run deterministic cleaning/preprocessing to generate model inputs.
+3. Run data-quality audit + feature diagnostics.
+4. Use curated daily features for model training and anomaly logic.
+5. Generate stakeholder-facing KPI and alert outputs.
 
 ## Repository Structure
 
@@ -99,6 +112,28 @@ Plots (if `matplotlib` is installed):
 - `normalized_output_and_soiling_proxy.png`
 - `availability_and_imbalance.png`
 
+## Cleaning + Preprocessing Script
+
+Run:
+
+```bash
+python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocessed
+```
+
+Outputs (under `artifacts/preprocessed/`):
+- `inverters_clean.csv`
+- `irradiance_clean.csv`
+- `generation_clean.csv`
+- `generation_daily_clean.csv`
+- `daily_model_input.csv`
+- `preprocessing_summary.md`
+
+`daily_model_input.csv` includes:
+- quality-gated daily features,
+- soiling proxy features,
+- B1/B2 mismatch features,
+- transfer-readiness fields (`transfer_quality_score`, `transfer_quality_tier`, `cross_plant_inference_ready`).
+
 ## Suggested Modeling Tracks
 
 1. Failure Prediction (ahead of time)
@@ -133,6 +168,6 @@ Plots (if `matplotlib` is installed):
 
 ## Immediate Next Steps
 
-1. Run `scripts/data_quality_audit.py` and review `artifacts/audit/quality_summary.md`.
-2. Validate generation-unit conversion assumptions in `scripts/power_generation_data_fetch.py` against ThingsBoard key semantics.
-3. Build the first training dataset from `daily_features.csv` with clear target definitions.
+1. Run `scripts/data_preprocess.py` and review `artifacts/preprocessed/preprocessing_summary.md`.
+2. Run `scripts/data_quality_audit.py` and review `artifacts/audit/quality_summary.md`.
+3. Build training targets from `artifacts/preprocessed/daily_model_input.csv`.
