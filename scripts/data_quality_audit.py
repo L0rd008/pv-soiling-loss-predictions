@@ -1,31 +1,35 @@
 import argparse
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+# Ensure sibling modules (daily_features) are importable from any cwd
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import pandas as pd
 
+from daily_features import (
+    MIN_IRRADIANCE_FOR_BASELINE,
+    MAX_NORMALIZED_OUTPUT,
+    INVERTER_INTERVAL_S,
+    EXPECTED_INV_RECORDS_PER_DAY,
+    EXPECTED_IRR_RECORDS_PER_DAY,
+    detect_block_power_cols as block_power_columns,
+    compute_soiling_features,
+    compute_quality_flags as _shared_quality_flags,
+)
+
 
 EXPECTED_INTERVAL_SECONDS = {
-    "inverters": 600,
+    "inverters": INVERTER_INTERVAL_S,
     "irradiance": 900,
     "generation": None,
 }
 
-# Minimum daily irradiance sum (W·s/m²) for a day to qualify for baseline.
-# Days below this are treated as sensor outage / corrupt and excluded from
-# the rolling clean baseline.  50 000 W·s/m² ≈ ~14 W/m² average over 1 hour.
-MIN_IRRADIANCE_FOR_BASELINE = 50_000.0
-
-# Sanity cap for normalized_output (energy_J / irradiance_sum).  Values above
-# this are clipped to NaN to prevent single-day spikes from corrupting the
-# rolling baseline.  Domain-reasonable max is ~500 000.
-MAX_NORMALIZED_OUTPUT = 500_000.0
-
-# Expected records per day for each dataset
 EXPECTED_DAILY_RECORDS = {
-    "inverters": 144,   # 24h * 6 per hour (10-min)
-    "irradiance": 96,   # 24h * 4 per hour (15-min)
+    "inverters": EXPECTED_INV_RECORDS_PER_DAY,
+    "irradiance": EXPECTED_IRR_RECORDS_PER_DAY,
 }
 
 
@@ -122,22 +126,6 @@ def inverter_prefixes(columns: Iterable[str]) -> List[str]:
         if col.endswith(" Current A (A)"):
             prefixes.add(col.replace(" Current A (A)", ""))
     return sorted(prefixes)
-
-
-def block_power_columns(
-    columns: Iterable[str],
-) -> Tuple[List[str], List[str]]:
-    """Partition power columns into B1 and B2 lists based on inverter name."""
-    b1_cols, b2_cols = [], []
-    for col in columns:
-        if not col.endswith("Active Power (W)"):
-            continue
-        col_lower = col.lower()
-        if "b1" in col_lower or "block1" in col_lower or "block 1" in col_lower:
-            b1_cols.append(col)
-        elif "b2" in col_lower or "block2" in col_lower or "block 2" in col_lower:
-            b2_cols.append(col)
-    return b1_cols, b2_cols
 
 
 def row_phase_imbalance(df: pd.DataFrame) -> pd.Series:
@@ -261,93 +249,36 @@ def build_daily_features(
             daily["block_mismatch_ratio"].rolling(14, min_periods=5).median()
         )
 
-    # --- Normalized output with irradiance sanity guard ---
-    # Only compute normalized output when irradiance exceeds the minimum
-    # threshold, preventing sensor-outage days from producing nonsensical spikes.
-    irradiance_valid = daily["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE
-    daily["normalized_output"] = np.where(
-        irradiance_valid,
-        daily["subset_energy_j"] / daily["irradiance_tilted_sum"],
-        np.nan,
-    )
-    # Cap extreme values to prevent baseline corruption
-    daily["normalized_output"] = daily["normalized_output"].clip(upper=MAX_NORMALIZED_OUTPUT)
-
-    daily["normalized_output_14d_median"] = (
-        daily["normalized_output"].rolling(14, min_periods=5).median()
-    )
-
-    # --- Soiling baseline: use 95th percentile rather than max for robustness ---
-    clear_day_threshold = daily["irradiance_tilted_sum"].quantile(0.60)
-    clear_day_mask = (
-        (daily["irradiance_tilted_sum"] >= clear_day_threshold)
-        & (daily["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE)
-    )
-
-    baseline_src = daily["normalized_output"].where(clear_day_mask)
-    daily["rolling_clean_baseline"] = (
-        baseline_src.rolling(30, min_periods=7)
-        .quantile(0.95)
-        .ffill()
-    )
-    daily["soiling_loss_pct_proxy"] = (
-        100.0
-        * (1.0 - (daily["normalized_output"] / daily["rolling_clean_baseline"]))
-    ).clip(lower=0, upper=100)
-    daily["soiling_rate_14d_pct_per_day"] = (
-        (daily["soiling_loss_pct_proxy"] - daily["soiling_loss_pct_proxy"].shift(14)) / 14.0
-    )
+    # --- Soiling features (shared logic) ---
+    daily = compute_soiling_features(daily)
 
     return daily.reset_index(names="day")
 
 
 def build_daily_flags(daily: pd.DataFrame) -> pd.DataFrame:
+    """Build daily flags combining shared quality flags with audit-specific ones."""
     frame = daily.copy()
 
-    irradiance_high_threshold = frame["irradiance_tilted_sum"].quantile(0.60)
     spread_high_threshold = frame["generation_intraday_spread_j"].quantile(0.95)
 
+    # Audit-specific flags (not in shared module)
     frame["flag_low_data_availability"] = frame["subset_data_availability_mean"] < 0.50
     frame["flag_high_phase_imbalance"] = frame["phase_imbalance_p95"] > 0.12
     frame["flag_zero_irr_nontrivial_gen"] = (
         (frame["irradiance_tilted_sum"] <= 1.0)
         & (frame["generation_mwh_latest"] > 5.0)
     )
-    frame["flag_low_output_high_irr"] = (
-        (frame["irradiance_tilted_sum"] >= irradiance_high_threshold)
-        & (frame["normalized_output"] < 0.70 * frame["normalized_output_14d_median"])
-    )
     frame["flag_large_generation_intraday_spread"] = (
         frame["generation_intraday_spread_j"] > spread_high_threshold
     )
 
-    # NEW: sensor-suspect irradiance — low irradiance but non-trivial inverter output
-    frame["flag_sensor_suspect_irradiance"] = (
-        (frame["irradiance_tilted_sum"] < MIN_IRRADIANCE_FOR_BASELINE)
-        & (frame["subset_energy_j"] > 0)
-        & (frame["subset_data_availability_mean"] > 0.30)
-    )
-
-    # NEW: coverage gap — less than 50% of expected interval records
-    if "inverter_records" in frame.columns:
-        expected_inv = EXPECTED_DAILY_RECORDS.get("inverters", 144)
-        frame["flag_coverage_gap"] = (
-            frame["inverter_records"] < (expected_inv * 0.50)
-        )
-    else:
-        frame["flag_coverage_gap"] = False
-
-    # NEW: block mismatch — B1/B2 ratio deviates >15% from rolling median
-    if "block_mismatch_ratio" in frame.columns and "block_mismatch_ratio_rolling_median" in frame.columns:
-        frame["flag_block_mismatch"] = (
-            (frame["block_mismatch_ratio"] - frame["block_mismatch_ratio_rolling_median"]).abs()
-            > 0.15 * frame["block_mismatch_ratio_rolling_median"].abs()
-        ) & frame["block_mismatch_ratio"].notna()
+    # Shared quality flags (sensor suspect, coverage gap, block mismatch, low output)
+    frame = _shared_quality_flags(frame)
 
     flag_cols = [c for c in frame.columns if c.startswith("flag_")]
     frame["flag_count"] = frame[flag_cols].fillna(False).sum(axis=1)
 
-    keep_cols = ["day"] + flag_cols + ["flag_count"]
+    keep_cols = ["day"] + sorted(flag_cols) + ["flag_count"]
     return frame[keep_cols].copy()
 
 
