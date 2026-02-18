@@ -1,0 +1,474 @@
+import argparse
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+EXPECTED_INTERVAL_SECONDS = {
+    "inverters": 600,
+    "irradiance": 900,
+    "generation": None,
+}
+
+
+def load_dataset(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required = {"Timestamp", "Date"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    numeric_cols = [c for c in df.columns if c not in ("Timestamp", "Date")]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.sort_values("Date").reset_index(drop=True)
+    return df
+
+
+def interval_distribution(
+    df: pd.DataFrame,
+    dataset: str,
+) -> Tuple[pd.DataFrame, Dict[str, Optional[float]]]:
+    diffs = df["Date"].diff().dt.total_seconds().dropna()
+    if diffs.empty:
+        dist = pd.DataFrame(columns=["dataset", "interval_seconds", "count"])
+        stats = {
+            "median_interval_seconds": np.nan,
+            "min_interval_seconds": np.nan,
+            "max_interval_seconds": np.nan,
+            "expected_interval_match_ratio": np.nan,
+            "large_gap_count": np.nan,
+        }
+        return dist, stats
+
+    interval_counts = (
+        diffs.value_counts(dropna=True)
+        .rename_axis("interval_seconds")
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+    )
+    interval_counts.insert(0, "dataset", dataset)
+
+    expected = EXPECTED_INTERVAL_SECONDS.get(dataset)
+    if expected is None:
+        expected_ratio = np.nan
+        large_gap_count = int((diffs > 3600).sum())
+    else:
+        expected_ratio = float((diffs == expected).mean())
+        large_gap_count = int((diffs > (expected * 3)).sum())
+
+    stats = {
+        "median_interval_seconds": float(diffs.median()),
+        "min_interval_seconds": float(diffs.min()),
+        "max_interval_seconds": float(diffs.max()),
+        "expected_interval_match_ratio": expected_ratio,
+        "large_gap_count": large_gap_count,
+    }
+    return interval_counts, stats
+
+
+def dataset_profile(df: pd.DataFrame, dataset: str) -> Dict[str, object]:
+    dist, stats = interval_distribution(df, dataset)
+    _ = dist
+    date_series = df["Date"]
+    return {
+        "dataset": dataset,
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
+        "start_date": date_series.min(),
+        "end_date": date_series.max(),
+        "unique_days": int(date_series.dt.date.nunique()),
+        "null_date_rows": int(date_series.isna().sum()),
+        "median_interval_seconds": stats["median_interval_seconds"],
+        "min_interval_seconds": stats["min_interval_seconds"],
+        "max_interval_seconds": stats["max_interval_seconds"],
+        "expected_interval_seconds": EXPECTED_INTERVAL_SECONDS.get(dataset),
+        "expected_interval_match_ratio": stats["expected_interval_match_ratio"],
+        "large_gap_count": stats["large_gap_count"],
+    }
+
+
+def missingness_frame(df: pd.DataFrame, dataset: str) -> pd.DataFrame:
+    cols = [c for c in df.columns if c not in ("Timestamp", "Date")]
+    missing = df[cols].isna().mean().rename("missing_ratio").reset_index()
+    missing = missing.rename(columns={"index": "column"})
+    missing.insert(0, "dataset", dataset)
+    return missing.sort_values("missing_ratio", ascending=False).reset_index(drop=True)
+
+
+def inverter_prefixes(columns: Iterable[str]) -> List[str]:
+    prefixes = set()
+    for col in columns:
+        if col.endswith(" Current A (A)"):
+            prefixes.add(col.replace(" Current A (A)", ""))
+    return sorted(prefixes)
+
+
+def row_phase_imbalance(df: pd.DataFrame) -> pd.Series:
+    prefixes = inverter_prefixes(df.columns)
+    if not prefixes:
+        return pd.Series(index=df.index, dtype=float)
+
+    per_inv = []
+    for prefix in prefixes:
+        phase_cols = [
+            f"{prefix} Current A (A)",
+            f"{prefix} Current B (A)",
+            f"{prefix} Current C (A)",
+        ]
+        if not all(col in df.columns for col in phase_cols):
+            continue
+        subset = df[phase_cols]
+        mean_current = subset.mean(axis=1)
+        imbalance = (subset.max(axis=1) - subset.min(axis=1)) / mean_current.replace(
+            0, np.nan
+        )
+        per_inv.append(imbalance.replace([np.inf, -np.inf], np.nan))
+
+    if not per_inv:
+        return pd.Series(index=df.index, dtype=float)
+
+    return pd.concat(per_inv, axis=1).mean(axis=1)
+
+
+def build_daily_features(
+    inverters: pd.DataFrame,
+    irradiance: pd.DataFrame,
+    generation: pd.DataFrame,
+) -> pd.DataFrame:
+    inv = inverters.copy()
+    irr = irradiance.copy()
+    gen = generation.copy()
+
+    inv["day"] = inv["Date"].dt.date
+    irr["day"] = irr["Date"].dt.date
+    gen["day"] = gen["Date"].dt.date
+
+    power_cols = [c for c in inv.columns if c.endswith("Active Power (W)")]
+    if not power_cols:
+        raise ValueError("No inverter power columns found.")
+
+    inv["subset_power_w"] = inv[power_cols].sum(axis=1, min_count=1)
+    inv["subset_energy_j_step"] = inv["subset_power_w"] * EXPECTED_INTERVAL_SECONDS["inverters"]
+    inv["subset_data_availability"] = inv[power_cols].notna().mean(axis=1)
+    inv["phase_imbalance"] = row_phase_imbalance(inv)
+
+    inv_daily = inv.groupby("day").agg(
+        subset_energy_j=("subset_energy_j_step", "sum"),
+        subset_power_w_p95=("subset_power_w", lambda s: s.quantile(0.95)),
+        subset_data_availability_mean=("subset_data_availability", "mean"),
+        subset_data_availability_p10=("subset_data_availability", lambda s: s.quantile(0.10)),
+        phase_imbalance_mean=("phase_imbalance", "mean"),
+        phase_imbalance_p95=("phase_imbalance", lambda s: s.quantile(0.95)),
+        inverter_records=("Timestamp", "size"),
+    )
+
+    irr_cols = [c for c in irr.columns if "Irradiance" in c]
+    if not irr_cols:
+        raise ValueError("No irradiance columns found.")
+
+    tilted_cols = [c for c in irr_cols if "Tilted" in c]
+    horizontal_cols = [c for c in irr_cols if "Horizontal" in c]
+    tilted_col = tilted_cols[0] if tilted_cols else irr_cols[0]
+    horizontal_col = horizontal_cols[0] if horizontal_cols else irr_cols[0]
+
+    irr_daily = irr.groupby("day").agg(
+        irradiance_horizontal_sum=(horizontal_col, "sum"),
+        irradiance_tilted_sum=(tilted_col, "sum"),
+        irradiance_records=("Timestamp", "size"),
+    )
+
+    gen_cols = [c for c in gen.columns if c not in ("Timestamp", "Date", "day")]
+    if len(gen_cols) != 1:
+        raise ValueError(f"Expected exactly one generation value column, got: {gen_cols}")
+    gen_col = gen_cols[0]
+
+    gen_sorted = gen.sort_values("Date")
+    gen_daily = gen_sorted.groupby("day").agg(
+        daily_generation_j_latest=(gen_col, "last"),
+        daily_generation_j_max=(gen_col, "max"),
+        daily_generation_j_min=(gen_col, "min"),
+        generation_records=("Timestamp", "size"),
+    )
+    gen_daily["generation_intraday_spread_j"] = (
+        gen_daily["daily_generation_j_max"] - gen_daily["daily_generation_j_min"]
+    )
+
+    daily = inv_daily.join(irr_daily, how="outer").join(gen_daily, how="outer")
+    daily = daily.sort_index()
+    daily.index = pd.to_datetime(daily.index, errors="coerce")
+
+    daily["subset_energy_mwh"] = daily["subset_energy_j"] / 3.6e9
+    daily["generation_mwh_latest"] = daily["daily_generation_j_latest"] / 3.6e9
+    daily["plant_to_subset_energy_ratio"] = (
+        daily["generation_mwh_latest"] / daily["subset_energy_mwh"]
+    )
+
+    irradiance_positive = daily["irradiance_tilted_sum"] > 0
+    daily["normalized_output"] = np.where(
+        irradiance_positive,
+        daily["subset_energy_j"] / daily["irradiance_tilted_sum"],
+        np.nan,
+    )
+
+    daily["normalized_output_14d_median"] = (
+        daily["normalized_output"].rolling(14, min_periods=5).median()
+    )
+
+    clear_day_threshold = daily["irradiance_tilted_sum"].quantile(0.60)
+    clear_day_mask = daily["irradiance_tilted_sum"] >= clear_day_threshold
+
+    baseline_src = daily["normalized_output"].where(clear_day_mask)
+    daily["rolling_clean_baseline"] = baseline_src.rolling(30, min_periods=7).max().ffill()
+    daily["soiling_loss_pct_proxy"] = (
+        100.0
+        * (1.0 - (daily["normalized_output"] / daily["rolling_clean_baseline"]))
+    ).clip(lower=0, upper=100)
+    daily["soiling_rate_14d_pct_per_day"] = (
+        (daily["soiling_loss_pct_proxy"] - daily["soiling_loss_pct_proxy"].shift(14)) / 14.0
+    )
+
+    return daily.reset_index(names="day")
+
+
+def build_daily_flags(daily: pd.DataFrame) -> pd.DataFrame:
+    frame = daily.copy()
+
+    irradiance_high_threshold = frame["irradiance_tilted_sum"].quantile(0.60)
+    spread_high_threshold = frame["generation_intraday_spread_j"].quantile(0.95)
+
+    frame["flag_low_data_availability"] = frame["subset_data_availability_mean"] < 0.50
+    frame["flag_high_phase_imbalance"] = frame["phase_imbalance_p95"] > 0.12
+    frame["flag_zero_irr_nontrivial_gen"] = (
+        (frame["irradiance_tilted_sum"] <= 1.0)
+        & (frame["generation_mwh_latest"] > 5.0)
+    )
+    frame["flag_low_output_high_irr"] = (
+        (frame["irradiance_tilted_sum"] >= irradiance_high_threshold)
+        & (frame["normalized_output"] < 0.70 * frame["normalized_output_14d_median"])
+    )
+    frame["flag_large_generation_intraday_spread"] = (
+        frame["generation_intraday_spread_j"] > spread_high_threshold
+    )
+
+    flag_cols = [c for c in frame.columns if c.startswith("flag_")]
+    frame["flag_count"] = frame[flag_cols].fillna(False).sum(axis=1)
+
+    keep_cols = ["day"] + flag_cols + ["flag_count"]
+    return frame[keep_cols].copy()
+
+
+def write_quality_summary(
+    output_path: Path,
+    profile_df: pd.DataFrame,
+    daily_features: pd.DataFrame,
+    daily_flags: pd.DataFrame,
+) -> None:
+    header = "|" + "|".join(profile_df.columns) + "|"
+    separator = "|" + "|".join(["---"] * len(profile_df.columns)) + "|"
+    rows = [
+        "|" + "|".join(str(v) for v in row) + "|"
+        for row in profile_df.itertuples(index=False, name=None)
+    ]
+    profile_table = "\n".join([header, separator] + rows)
+
+    total_days = len(daily_features)
+    flagged_days = int((daily_flags["flag_count"] > 0).sum())
+    high_imbalance_days = int(daily_flags["flag_high_phase_imbalance"].sum())
+    low_data_days = int(daily_flags["flag_low_data_availability"].sum())
+    low_output_days = int(daily_flags["flag_low_output_high_irr"].sum())
+    zero_irr_gen_days = int(daily_flags["flag_zero_irr_nontrivial_gen"].sum())
+
+    soiling_median = daily_features["soiling_loss_pct_proxy"].median()
+    soiling_p90 = daily_features["soiling_loss_pct_proxy"].quantile(0.90)
+    ratio_median = daily_features["plant_to_subset_energy_ratio"].median()
+
+    lines = [
+        "# Data Quality Summary",
+        "",
+        "## Dataset Profile",
+        profile_table,
+        "",
+        "## Daily KPI + Flags",
+        f"- Total merged days: {total_days}",
+        f"- Days with >=1 flag: {flagged_days}",
+        f"- Low data availability days: {low_data_days}",
+        f"- High phase imbalance days: {high_imbalance_days}",
+        f"- Low output under high irradiance days: {low_output_days}",
+        f"- Zero irradiance but nontrivial generation days: {zero_irr_gen_days}",
+        "",
+        "## Proxy Metrics",
+        f"- Median soiling loss proxy (%): {soiling_median:.2f}",
+        f"- 90th percentile soiling loss proxy (%): {soiling_p90:.2f}",
+        f"- Median plant/subset daily energy ratio: {ratio_median:.2f}",
+        "",
+        "## Notes",
+        "- Plant-level generation is compared against only 8 sampled inverters, so ratio scaling should be interpreted with context.",
+        "- Generation feed has multiple intraday points and should be treated as event telemetry, not strictly one row per day.",
+        "- Use flagged days to drive manual inspection before model training.",
+    ]
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def try_generate_plots(
+    output_dir: Path,
+    interval_df: pd.DataFrame,
+    daily_features: pd.DataFrame,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    # Interval histograms
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=False)
+    datasets = ["inverters", "irradiance", "generation"]
+    for ax, name in zip(axes, datasets):
+        subset = interval_df[interval_df["dataset"] == name].copy()
+        if subset.empty:
+            ax.set_title(f"{name}: no interval data")
+            continue
+        subset = subset.sort_values("count", ascending=False).head(30)
+        ax.bar(subset["interval_seconds"].astype(str), subset["count"])
+        ax.set_title(f"{name}: top interval counts")
+        ax.set_ylabel("count")
+        ax.tick_params(axis="x", rotation=90)
+    fig.tight_layout()
+    fig.savefig(output_dir / "interval_histograms.png", dpi=150)
+    plt.close(fig)
+
+    # Normalized output + soiling proxy
+    df = daily_features.copy()
+    df["day"] = pd.to_datetime(df["day"], errors="coerce")
+    df = df.sort_values("day")
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    axes[0].plot(df["day"], df["normalized_output"], label="normalized_output", linewidth=1.0)
+    axes[0].plot(
+        df["day"],
+        df["rolling_clean_baseline"],
+        label="rolling_clean_baseline",
+        linewidth=1.3,
+    )
+    axes[0].set_ylabel("J / irradiance_sum")
+    axes[0].legend(loc="upper right")
+    axes[0].set_title("Normalized Output vs Rolling Baseline")
+
+    axes[1].plot(
+        df["day"],
+        df["soiling_loss_pct_proxy"],
+        label="soiling_loss_pct_proxy",
+        linewidth=1.2,
+        color="tab:red",
+    )
+    axes[1].set_ylabel("%")
+    axes[1].set_title("Soiling Loss Proxy")
+    axes[1].legend(loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "normalized_output_and_soiling_proxy.png", dpi=150)
+    plt.close(fig)
+
+    # Availability + imbalance
+    fig, ax1 = plt.subplots(figsize=(12, 4.8))
+    ax1.plot(
+        df["day"],
+        df["subset_data_availability_mean"],
+        color="tab:blue",
+        label="subset_data_availability_mean",
+    )
+    ax1.set_ylabel("availability", color="tab:blue")
+    ax1.tick_params(axis="y", labelcolor="tab:blue")
+
+    ax2 = ax1.twinx()
+    ax2.plot(
+        df["day"],
+        df["phase_imbalance_p95"],
+        color="tab:orange",
+        label="phase_imbalance_p95",
+    )
+    ax2.set_ylabel("imbalance", color="tab:orange")
+    ax2.tick_params(axis="y", labelcolor="tab:orange")
+
+    ax1.set_title("Data Availability and Phase Imbalance")
+    fig.tight_layout()
+    fig.savefig(output_dir / "availability_and_imbalance.png", dpi=150)
+    plt.close(fig)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Audit PV telemetry datasets and build daily features for soiling analysis."
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="Directory containing CSV exports.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("artifacts/audit"),
+        help="Directory for audit outputs.",
+    )
+    args = parser.parse_args()
+
+    files = {
+        "inverters": args.data_dir / "inverters_2025_to_current_10min_avg_si.csv",
+        "irradiance": args.data_dir / "irradiance_2025_to_current_15min_sum_si.csv",
+        "generation": args.data_dir / "power_generation_2025_to_current_1day_none_si.csv",
+    }
+
+    for name, path in files.items():
+        if not path.exists():
+            raise FileNotFoundError(f"Missing {name} file at: {path}")
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    frames = {name: load_dataset(path) for name, path in files.items()}
+
+    profile_rows = []
+    interval_parts = []
+    missing_parts = []
+
+    for name, df in frames.items():
+        profile_rows.append(dataset_profile(df, name))
+        interval_df, _ = interval_distribution(df, name)
+        interval_parts.append(interval_df)
+        missing_parts.append(missingness_frame(df, name))
+
+    profile_df = pd.DataFrame(profile_rows).sort_values("dataset")
+    interval_df = pd.concat(interval_parts, ignore_index=True)
+    missing_df = pd.concat(missing_parts, ignore_index=True)
+
+    daily_features = build_daily_features(
+        frames["inverters"],
+        frames["irradiance"],
+        frames["generation"],
+    )
+    daily_flags = build_daily_flags(daily_features)
+
+    profile_df.to_csv(args.out_dir / "dataset_profile.csv", index=False)
+    interval_df.to_csv(args.out_dir / "interval_distribution.csv", index=False)
+    missing_df.to_csv(args.out_dir / "missingness_by_column.csv", index=False)
+    daily_features.to_csv(args.out_dir / "daily_features.csv", index=False)
+    daily_flags.to_csv(args.out_dir / "daily_flags.csv", index=False)
+
+    write_quality_summary(
+        args.out_dir / "quality_summary.md",
+        profile_df,
+        daily_features,
+        daily_flags,
+    )
+    try_generate_plots(args.out_dir, interval_df, daily_features)
+
+    print(f"Audit complete. Outputs written to: {args.out_dir}")
+
+
+if __name__ == "__main__":
+    main()
