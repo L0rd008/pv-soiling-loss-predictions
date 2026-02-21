@@ -4,7 +4,7 @@
 
 Build a deterministic preprocessing layer that converts raw telemetry exports
 into quality-gated daily features for:
-- soiling-loss modeling,
+- performance-loss modeling,
 - anomaly detection,
 - cross-plant inference support.
 
@@ -50,7 +50,7 @@ Output files:
 5. Feature engineering
 - `normalized_output` with irradiance floor guard.
 - rolling clean baseline (30-day, 95th percentile on clear days).
-- soiling proxy percentage.
+- performance loss proxy percentage.
 - B1/B2 mismatch metrics.
 
 6. Transfer-readiness gating
@@ -62,6 +62,6 @@ Output files:
 
 - preprocessing script exits successfully.
 - output files are generated.
-- `soiling_loss_pct_proxy` remains in `[0, 100]`.
+- `performance_loss_pct_proxy` remains in `[0, 100]`.
 - `normalized_output` is capped to prevent outlier corruption.
 - transfer readiness fields are populated.

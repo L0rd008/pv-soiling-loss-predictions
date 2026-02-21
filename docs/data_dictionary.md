@@ -108,13 +108,30 @@ Core fields:
 - `plant_to_subset_energy_ratio`
 - `normalized_output`
 - `rolling_clean_baseline`
-- `soiling_loss_pct_proxy`
+- `performance_loss_pct_proxy`
+- `perf_loss_rate_14d_pct_per_day`
 
 Block fields:
 - `b1_energy_j`, `b2_energy_j`
 - `b1_data_availability`, `b2_data_availability`
 - `block_mismatch_ratio`
 - `block_mismatch_ratio_rolling_median`
+
+Environmental features (from Solcast):
+- `pm25_mean`, `pm25_max` — fine dust (µg/m³)
+- `pm10_mean`, `pm10_max` — coarse dust (µg/m³)
+- `precipitation_total_mm` — daily rainfall
+- `humidity_mean`, `humidity_max` — relative humidity (%)
+- `wind_speed_10m_mean`, `wind_speed_10m_max` — surface wind (m/s)
+- `wind_speed_100m_mean` — regional wind (m/s)
+- `dewpoint_mean` — dewpoint temperature (°C)
+- `air_temp_mean`, `air_temp_min`, `air_temp_max` — air temperature (°C)
+- `cloud_opacity_mean` — cloud cover (%)
+- `pressure_mean` — surface pressure (hPa)
+- `solcast_ghi_sum`, `solcast_gti_sum` — modelled irradiance (W·s/m²)
+- `solcast_dni_mean` — direct normal irradiance (W/m²)
+- `rain_day` — boolean: any precipitation > 0.1 mm/h
+- `dominant_weather` — most frequent weather type string
 
 Quality flags:
 - `flag_sensor_suspect_irradiance`
@@ -125,6 +142,49 @@ Cross-plant transfer fields:
 - `transfer_quality_score` (0-100)
 - `transfer_quality_tier` (`high`/`medium`/`low`)
 - `cross_plant_inference_ready` (boolean)
+
+## Raw Solcast Data (`data/`)
+
+### `soiling_2025_to_current_10min_none_std.csv`
+
+10-minute Solcast environmental data for performance-relevant variables (PM, weather, wind, etc.).
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `air_temp_celcius` | float | °C | Ambient air temperature |
+| `cloud_opacity_percentage` | float | % | Cloud cover percentage |
+| `dewpoint_temp_celcius` | float | °C | Dewpoint temperature |
+| `precipitable_water_kg_m2` | float | kg/m² | Column precipitable water |
+| `precipitation_rate_mm_h` | float | mm/h | Precipitation rate |
+| `relative_humidity_percentage` | float | % | Relative humidity |
+| `surface_pressure_hpa` | float | hPa | Surface pressure |
+| `wind_direction_100m_deg_from_north` | float | ° | Wind direction at 100m |
+| `wind_direction_10m_deg_from_north` | float | ° | Wind direction at 10m |
+| `wind_speed_100m_m_s` | float | m/s | Wind speed at 100m |
+| `wind_speed_10m_m_s` | float | m/s | Wind speed at 10m |
+| `weather_type_str` | string | — | Weather type category |
+| `min_air_temp_celcius` | float | °C | Min temperature in period |
+| `max_air_temp_celcius` | float | °C | Max temperature in period |
+| `pm10_micro_g_m3` | float | µg/m³ | PM10 particulate matter |
+| `pm2.5_micro_g_m3` | float | µg/m³ | PM2.5 particulate matter |
+| `period_end` | datetime | ISO 8601 | Period end timestamp |
+| `period` | string | ISO 8601 | Duration of period (PT10M) |
+
+### `irradiance_2025_to_current_10min_none_std.csv`
+
+10-minute Solcast modelled irradiance data.
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `albedo_frac` | float | fraction | Ground albedo |
+| `azimuth_deg_from_north` | float | ° | Solar azimuth angle |
+| `dhi_w_m2` | float | W/m² | Diffuse horizontal irradiance |
+| `dni_w_m2` | float | W/m² | Direct normal irradiance |
+| `ghi_w_m2` | float | W/m² | Global horizontal irradiance |
+| `gti_w_m2` | float | W/m² | Global tilted irradiance |
+| `zenith_deg_from_vertical` | float | ° | Solar zenith angle |
+| `period_end` | datetime | ISO 8601 | Period end timestamp |
+| `period` | string | ISO 8601 | Duration of period (PT10M) |
 
 ## Audit Outputs (`artifacts/audit/`)
 

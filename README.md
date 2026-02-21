@@ -1,6 +1,6 @@
 # Soiling Loss Predictions for Utility-Scale PV
 
-This repository is for building AI/ML workflows that help PV stakeholders detect failures early, run real-time anomaly detection, estimate soiling/degradation trends, and optimize cleaning/O&M decisions.
+This repository is for building AI/ML workflows that help PV stakeholders detect failures early, run real-time anomaly detection, estimate performance-loss/degradation trends, and optimize cleaning/O&M decisions.
 
 Current plant context:
 - Plant size: ~10-15 MW
@@ -27,7 +27,7 @@ Practical implications:
 - Daytime-only incident filtering to reduce false alarms.
 
 `Performance Engineers`
-- Soiling loss proxy trend (% loss vs rolling clean baseline).
+- Performance loss proxy trend (% loss vs rolling clean baseline).
 - Degradation proxy trend (long-term normalized-output slope).
 - Inverter/block-level underperformance ranking.
 
@@ -37,7 +37,7 @@ Practical implications:
 
 `Asset Owners / Investors`
 - Daily and monthly KPI summaries with confidence flags.
-- Lost-energy estimate due to soiling/anomalies.
+- Lost-energy estimate due to performance loss/anomalies.
 
 `Portfolio Managers`
 - Plant-comparable normalized KPIs and alert severity buckets.
@@ -109,7 +109,7 @@ Outputs (under `artifacts/audit/`):
 
 Plots (if `matplotlib` is installed):
 - `interval_histograms.png`
-- `normalized_output_and_soiling_proxy.png`
+- `normalized_output_and_performance_proxy.png`
 - `availability_and_imbalance.png`
 
 ## Cleaning + Preprocessing Script
@@ -130,7 +130,7 @@ Outputs (under `artifacts/preprocessed/`):
 
 `daily_model_input.csv` includes:
 - quality-gated daily features,
-- soiling proxy features,
+- performance loss proxy features,
 - B1/B2 mismatch features,
 - transfer-readiness fields (`transfer_quality_score`, `transfer_quality_tier`, `cross_plant_inference_ready`).
 
@@ -146,12 +146,12 @@ Outputs (under `artifacts/preprocessed/`):
 - Output: alert with reason code (`underpower`, `phase_imbalance`, `sensor_suspect`, `data_gap`).
 
 3. Cleaning Optimization
-- Input: soiling-loss proxy trend + cleaning cost assumptions + energy price.
+- Input: performance-loss proxy trend + cleaning cost assumptions + energy price.
 - Output: recommended cleaning date and expected payback window.
 
 ## Additional Predictions Derivable From Current Data
 
-- Soiling rate (% loss/day) from normalized-output drift vs rolling clean baseline.
+- Performance loss rate (% loss/day) from normalized-output drift vs rolling clean baseline.
 - Block-level mismatch index (`B1` vs `B2` relative output under similar irradiance).
 - Inverter health score (availability, variability, imbalance, anomaly counts).
 - Sensor consistency score (horizontal vs tilted irradiance coherence).
