@@ -25,8 +25,9 @@ from daily_features import (
     aggregate_block_daily,
     aggregate_inverter_daily,
     aggregate_irradiance_daily,
+    aggregate_solcast_daily,
     compute_quality_flags,
-    compute_soiling_features,
+    compute_performance_features,
     compute_transfer_readiness,
 )
 
@@ -167,10 +168,11 @@ def build_daily_model_table(
     inverters: pd.DataFrame,
     irradiance: pd.DataFrame,
     generation_daily: pd.DataFrame,
+    solcast_daily: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """Build the daily model input table from cleaned sub-daily data.
 
-    Uses shared feature functions from ``daily_features`` module for soiling,
+    Uses shared feature functions from ``daily_features`` module for performance
     flags, and transfer readiness to stay in sync with the audit pipeline.
     """
     inv = inverters.copy()
@@ -196,6 +198,10 @@ def build_daily_model_table(
         .reset_index(drop=True)
     )
 
+    # --- Solcast environmental features ---
+    if solcast_daily is not None and not solcast_daily.empty:
+        daily = daily.merge(solcast_daily, on="day", how="left")
+
     # --- Derived energy columns ---
     daily["subset_energy_mwh"] = daily["subset_energy_j"] / 3.6e9
     daily["generation_mwh"] = daily["daily_generation_j"] / 3.6e9
@@ -203,8 +209,8 @@ def build_daily_model_table(
         daily["generation_mwh"] / daily["subset_energy_mwh"]
     )
 
-    # --- Soiling features (shared logic) ---
-    daily = compute_soiling_features(daily)
+    # --- Performance loss features (shared logic) ---
+    daily = compute_performance_features(daily)
 
     # --- Quality flags (shared logic) ---
     daily = compute_quality_flags(daily)
@@ -238,11 +244,11 @@ def write_preprocessing_summary(
     low_out = int(daily.get("flag_low_output_high_irr", pd.Series(dtype=bool)).sum())
     total_flagged = int((daily.get("flag_count", 0) > 0).sum())
 
-    # Soiling distribution
-    soiling = daily["soiling_loss_pct_proxy"]
-    soiling_med = soiling.median()
-    soiling_p90 = soiling.quantile(0.90)
-    soiling_max = soiling.max()
+    # Performance loss distribution
+    perf_loss = daily["performance_loss_pct_proxy"]
+    perf_med = perf_loss.median()
+    perf_p90 = perf_loss.quantile(0.90)
+    perf_max = perf_loss.max()
 
     # Block metrics
     block_lines = []
@@ -285,10 +291,10 @@ def write_preprocessing_summary(
         f"- Cross-plant inference ready days: {ready_days}/{total_days}",
         f"- Transfer tier counts: high={high_days}, medium={medium_days}, low={low_days}",
         "",
-        "## Soiling Proxy Distribution",
-        f"- Median: {soiling_med:.2f}%",
-        f"- 90th percentile: {soiling_p90:.2f}%",
-        f"- Max: {soiling_max:.2f}%",
+        "## Performance Loss Proxy Distribution",
+        f"- Median: {perf_med:.2f}%",
+        f"- 90th percentile: {perf_p90:.2f}%",
+        f"- Max: {perf_max:.2f}%",
         "",
         "## Flag Breakdown",
         f"- Sensor-suspect irradiance days: {sens_suspect}",
@@ -332,12 +338,24 @@ def main() -> None:
         if not path.exists():
             raise FileNotFoundError(f"Missing required data file: {path}")
 
+    # Solcast files (optional — skip gracefully if not found)
+    solcast_soiling_path = args.data_dir / "soiling_2025_to_current_10min_none_std.csv"
+    solcast_irradiance_path = args.data_dir / "irradiance_2025_to_current_10min_none_std.csv"
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     inv_clean, inv_stats = clean_inverters(inverters_path)
     irr_clean, irr_stats = clean_irradiance(irradiance_path)
     gen_clean, gen_daily, gen_stats = clean_generation(generation_path)
-    daily_model = build_daily_model_table(inv_clean, irr_clean, gen_daily)
+
+    # Aggregate Solcast to daily (if available)
+    solcast_daily = None
+    if solcast_soiling_path.exists():
+        sc_irr = solcast_irradiance_path if solcast_irradiance_path.exists() else None
+        solcast_daily = aggregate_solcast_daily(solcast_soiling_path, sc_irr)
+        print(f"  Solcast daily features: {len(solcast_daily)} days, {len(solcast_daily.columns)} columns")
+
+    daily_model = build_daily_model_table(inv_clean, irr_clean, gen_daily, solcast_daily)
 
     inv_clean.to_csv(args.out_dir / "inverters_clean.csv", index=False)
     irr_clean.to_csv(args.out_dir / "irradiance_clean.csv", index=False)
@@ -354,6 +372,7 @@ def main() -> None:
     )
 
     print(f"Preprocessing complete. Outputs written to: {args.out_dir}")
+    print(f"  daily_model_input.csv: {len(daily_model)} rows x {len(daily_model.columns)} columns")
 
 
 if __name__ == "__main__":

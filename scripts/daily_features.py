@@ -65,6 +65,156 @@ def detect_irradiance_cols(
 
 
 # ---------------------------------------------------------------------------
+# Solcast data aggregation
+# ---------------------------------------------------------------------------
+
+SOLCAST_INTERVAL_S = 600  # 10-minute Solcast records
+
+# Columns from soiling CSV and their roles
+_SOLCAST_SOILING_COLS = {
+    "pm2.5_micro_g_m3": "pm25",
+    "pm10_micro_g_m3": "pm10",
+    "precipitation_rate_mm_h": "precipitation",
+    "relative_humidity_percentage": "humidity",
+    "wind_speed_10m_m_s": "wind_speed_10m",
+    "wind_speed_100m_m_s": "wind_speed_100m",
+    "dewpoint_temp_celcius": "dewpoint",
+    "air_temp_celcius": "air_temp",
+    "min_air_temp_celcius": "air_temp_min_raw",
+    "max_air_temp_celcius": "air_temp_max_raw",
+    "cloud_opacity_percentage": "cloud_opacity",
+    "surface_pressure_hpa": "pressure",
+    "weather_type_str": "weather_type",
+}
+
+
+def _load_solcast_csv(path) -> pd.DataFrame:
+    """Load a Solcast CSV, parse period_end as datetime, extract day."""
+    df = pd.read_csv(path)
+    if "period_end" not in df.columns:
+        raise ValueError(f"Solcast CSV missing 'period_end' column: {path}")
+    df["period_end"] = pd.to_datetime(df["period_end"], utc=True, errors="coerce")
+    df["day"] = df["period_end"].dt.tz_convert("Asia/Kolkata").dt.floor("D").dt.tz_localize(None)
+    return df
+
+
+def aggregate_solcast_daily(
+    soiling_path,
+    irradiance_path=None,
+) -> pd.DataFrame:
+    """Aggregate 10-minute Solcast data to daily summaries.
+
+    Parameters
+    ----------
+    soiling_path : Path
+        Path to the Solcast soiling/environmental CSV.
+    irradiance_path : Path, optional
+        Path to the Solcast irradiance CSV.  If None, only environmental
+        features are returned.
+
+    Returns
+    -------
+    pd.DataFrame
+        Daily aggregated features with ``day`` as datetime column.
+    """
+    from pathlib import Path
+    soiling_path = Path(soiling_path)
+    sol = _load_solcast_csv(soiling_path)
+
+    # Cast numeric columns
+    for raw_col in _SOLCAST_SOILING_COLS:
+        if raw_col in sol.columns and raw_col != "weather_type_str":
+            sol[raw_col] = pd.to_numeric(sol[raw_col], errors="coerce")
+
+    # --- Numeric aggregations ---
+    agg_dict = {}
+
+    # PM2.5
+    if "pm2.5_micro_g_m3" in sol.columns:
+        agg_dict["pm25_mean"] = ("pm2.5_micro_g_m3", "mean")
+        agg_dict["pm25_max"] = ("pm2.5_micro_g_m3", "max")
+
+    # PM10
+    if "pm10_micro_g_m3" in sol.columns:
+        agg_dict["pm10_mean"] = ("pm10_micro_g_m3", "mean")
+        agg_dict["pm10_max"] = ("pm10_micro_g_m3", "max")
+
+    # Precipitation: rate (mm/h) × (10 min / 60 min) = mm per interval
+    if "precipitation_rate_mm_h" in sol.columns:
+        sol["_precip_mm_step"] = sol["precipitation_rate_mm_h"] * (10.0 / 60.0)
+        agg_dict["precipitation_total_mm"] = ("_precip_mm_step", "sum")
+        sol["_has_rain"] = sol["precipitation_rate_mm_h"] > 0.1
+        agg_dict["rain_day"] = ("_has_rain", "any")
+
+    # Humidity
+    if "relative_humidity_percentage" in sol.columns:
+        agg_dict["humidity_mean"] = ("relative_humidity_percentage", "mean")
+        agg_dict["humidity_max"] = ("relative_humidity_percentage", "max")
+
+    # Wind
+    if "wind_speed_10m_m_s" in sol.columns:
+        agg_dict["wind_speed_10m_mean"] = ("wind_speed_10m_m_s", "mean")
+        agg_dict["wind_speed_10m_max"] = ("wind_speed_10m_m_s", "max")
+    if "wind_speed_100m_m_s" in sol.columns:
+        agg_dict["wind_speed_100m_mean"] = ("wind_speed_100m_m_s", "mean")
+
+    # Dewpoint
+    if "dewpoint_temp_celcius" in sol.columns:
+        agg_dict["dewpoint_mean"] = ("dewpoint_temp_celcius", "mean")
+
+    # Temperature
+    if "air_temp_celcius" in sol.columns:
+        agg_dict["air_temp_mean"] = ("air_temp_celcius", "mean")
+    if "min_air_temp_celcius" in sol.columns:
+        agg_dict["air_temp_min"] = ("min_air_temp_celcius", "min")
+    if "max_air_temp_celcius" in sol.columns:
+        agg_dict["air_temp_max"] = ("max_air_temp_celcius", "max")
+
+    # Cloud & pressure
+    if "cloud_opacity_percentage" in sol.columns:
+        agg_dict["cloud_opacity_mean"] = ("cloud_opacity_percentage", "mean")
+    if "surface_pressure_hpa" in sol.columns:
+        agg_dict["pressure_mean"] = ("surface_pressure_hpa", "mean")
+
+    sol_daily = sol.groupby("day").agg(**agg_dict).reset_index()
+
+    # --- Weather type mode (dominant weather) ---
+    if "weather_type_str" in sol.columns:
+        weather_mode = (
+            sol.groupby("day")["weather_type_str"]
+            .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else "UNKNOWN")
+            .reset_index()
+            .rename(columns={"weather_type_str": "dominant_weather"})
+        )
+        sol_daily = sol_daily.merge(weather_mode, on="day", how="left")
+
+    # --- Solcast irradiance (optional) ---
+    if irradiance_path is not None:
+        irradiance_path = Path(irradiance_path)
+        if irradiance_path.exists():
+            irr = _load_solcast_csv(irradiance_path)
+            for c in ["ghi_w_m2", "gti_w_m2", "dni_w_m2", "dhi_w_m2"]:
+                if c in irr.columns:
+                    irr[c] = pd.to_numeric(irr[c], errors="coerce")
+
+            irr_agg = {}
+            if "ghi_w_m2" in irr.columns:
+                irr["_ghi_ws"] = irr["ghi_w_m2"] * SOLCAST_INTERVAL_S
+                irr_agg["solcast_ghi_sum"] = ("_ghi_ws", "sum")
+            if "gti_w_m2" in irr.columns:
+                irr["_gti_ws"] = irr["gti_w_m2"] * SOLCAST_INTERVAL_S
+                irr_agg["solcast_gti_sum"] = ("_gti_ws", "sum")
+            if "dni_w_m2" in irr.columns:
+                irr_agg["solcast_dni_mean"] = ("dni_w_m2", "mean")
+
+            if irr_agg:
+                irr_daily = irr.groupby("day").agg(**irr_agg).reset_index()
+                sol_daily = sol_daily.merge(irr_daily, on="day", how="outer")
+
+    return sol_daily
+
+
+# ---------------------------------------------------------------------------
 # Daily aggregation
 # ---------------------------------------------------------------------------
 
@@ -167,11 +317,11 @@ def aggregate_irradiance_daily(irr: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Soiling features
+# Performance loss features
 # ---------------------------------------------------------------------------
 
-def compute_soiling_features(daily: pd.DataFrame) -> pd.DataFrame:
-    """Add normalized output, rolling baseline, and soiling proxy to daily table.
+def compute_performance_features(daily: pd.DataFrame) -> pd.DataFrame:
+    """Add normalized output, rolling baseline, and performance loss proxy.
 
     Expects columns: ``subset_energy_j``, ``irradiance_tilted_sum``.
     Modifies ``daily`` in place and returns it.
@@ -200,14 +350,14 @@ def compute_soiling_features(daily: pd.DataFrame) -> pd.DataFrame:
         baseline_src.rolling(30, min_periods=7).quantile(0.95).ffill()
     )
 
-    # Soiling loss proxy
-    daily["soiling_loss_pct_proxy"] = (
+    # Performance loss proxy (all-cause deficit vs rolling clean baseline)
+    daily["performance_loss_pct_proxy"] = (
         100.0 * (1.0 - (daily["normalized_output"] / daily["rolling_clean_baseline"]))
     ).clip(lower=0, upper=100)
 
-    # Soiling rate (trend feature for cleaning predictions)
-    daily["soiling_rate_14d_pct_per_day"] = (
-        (daily["soiling_loss_pct_proxy"] - daily["soiling_loss_pct_proxy"].shift(14)) / 14.0
+    # Performance loss rate (trend feature for cleaning predictions)
+    daily["perf_loss_rate_14d_pct_per_day"] = (
+        (daily["performance_loss_pct_proxy"] - daily["performance_loss_pct_proxy"].shift(14)) / 14.0
     )
 
     return daily
@@ -287,9 +437,9 @@ def compute_transfer_readiness(daily: pd.DataFrame) -> pd.DataFrame:
     # Penalty: block mismatch
     score -= np.where(daily.get("flag_block_mismatch", False), 10.0, 0.0)
 
-    # Penalty: missing soiling proxy
-    if "soiling_loss_pct_proxy" in daily.columns:
-        score -= np.where(daily["soiling_loss_pct_proxy"].isna(), 15.0, 0.0)
+    # Penalty: missing performance loss proxy
+    if "performance_loss_pct_proxy" in daily.columns:
+        score -= np.where(daily["performance_loss_pct_proxy"].isna(), 15.0, 0.0)
 
     daily["transfer_quality_score"] = np.clip(score, 0.0, 100.0)
 

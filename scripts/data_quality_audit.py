@@ -16,7 +16,8 @@ from daily_features import (
     EXPECTED_INV_RECORDS_PER_DAY,
     EXPECTED_IRR_RECORDS_PER_DAY,
     detect_block_power_cols as block_power_columns,
-    compute_soiling_features,
+    aggregate_solcast_daily,
+    compute_performance_features,
     compute_quality_flags as _shared_quality_flags,
 )
 
@@ -159,6 +160,7 @@ def build_daily_features(
     inverters: pd.DataFrame,
     irradiance: pd.DataFrame,
     generation: pd.DataFrame,
+    solcast_daily: pd.DataFrame = None,
 ) -> pd.DataFrame:
     inv = inverters.copy()
     irr = irradiance.copy()
@@ -186,6 +188,9 @@ def build_daily_features(
         phase_imbalance_p95=("phase_imbalance", lambda s: s.quantile(0.95)),
         inverter_records=("Timestamp", "size"),
     )
+    inv_daily["inverter_coverage_ratio"] = (
+        inv_daily["inverter_records"] / EXPECTED_INV_RECORDS_PER_DAY
+    ).clip(upper=1.0)
 
     irr_cols = [c for c in irr.columns if "Irradiance" in c]
     if not irr_cols:
@@ -201,6 +206,9 @@ def build_daily_features(
         irradiance_tilted_sum=(tilted_col, "sum"),
         irradiance_records=("Timestamp", "size"),
     )
+    irr_daily["irradiance_coverage_ratio"] = (
+        irr_daily["irradiance_records"] / EXPECTED_IRR_RECORDS_PER_DAY
+    ).clip(upper=1.0)
 
     gen_cols = [c for c in gen.columns if c not in ("Timestamp", "Date", "day")]
     if len(gen_cols) != 1:
@@ -249,10 +257,24 @@ def build_daily_features(
             daily["block_mismatch_ratio"].rolling(14, min_periods=5).median()
         )
 
-    # --- Soiling features (shared logic) ---
-    daily = compute_soiling_features(daily)
+    # --- Performance loss features (shared logic) ---
+    daily = compute_performance_features(daily)
 
-    return daily.reset_index(names="day")
+    # --- Merge Solcast environmental features ---
+    # Always reset the day index to a column first
+    if daily.index.name == "day":
+        daily = daily.reset_index()
+    if "day" not in daily.columns:
+        raise ValueError("Expected 'day' column in daily features after reset_index.")
+
+    daily["day"] = pd.to_datetime(daily["day"], errors="coerce")
+
+    if solcast_daily is not None and not solcast_daily.empty:
+        solcast_daily = solcast_daily.copy()
+        solcast_daily["day"] = pd.to_datetime(solcast_daily["day"], errors="coerce")
+        daily = daily.merge(solcast_daily, on="day", how="left")
+
+    return daily
 
 
 def build_daily_flags(daily: pd.DataFrame) -> pd.DataFrame:
@@ -306,8 +328,8 @@ def write_quality_summary(
     coverage_gap_days = int(daily_flags.get("flag_coverage_gap", pd.Series(dtype=bool)).sum())
     block_mismatch_days = int(daily_flags.get("flag_block_mismatch", pd.Series(dtype=bool)).sum())
 
-    soiling_median = daily_features["soiling_loss_pct_proxy"].median()
-    soiling_p90 = daily_features["soiling_loss_pct_proxy"].quantile(0.90)
+    perf_loss_median = daily_features["performance_loss_pct_proxy"].median()
+    perf_loss_p90 = daily_features["performance_loss_pct_proxy"].quantile(0.90)
     ratio_median = daily_features["plant_to_subset_energy_ratio"].median()
 
     # Block metrics (if available)
@@ -335,11 +357,11 @@ def write_quality_summary(
         f"- Low output under high irradiance days: {low_output_days}",
         f"- Zero irradiance but nontrivial generation days: {zero_irr_gen_days}",
         f"- Sensor-suspect irradiance days: {sensor_suspect_days}",
-        f"- Coverage gap days (< 50% records): {coverage_gap_days}",
+        f"- Coverage gap days (< 30% expected records): {coverage_gap_days}",
         "",
         "## Proxy Metrics",
-        f"- Median soiling loss proxy (%): {soiling_median:.2f}",
-        f"- 90th percentile soiling loss proxy (%): {soiling_p90:.2f}",
+        f"- Median performance loss proxy (%): {perf_loss_median:.2f}",
+        f"- 90th percentile performance loss proxy (%): {perf_loss_p90:.2f}",
         f"- Median plant/subset daily energy ratio: {ratio_median:.2f}",
     ] + block_lines + [
         "",
@@ -348,7 +370,7 @@ def write_quality_summary(
         "- Generation feed has multiple intraday points and should be treated as event telemetry, not strictly one row per day.",
         f"- Normalized output values capped at {MAX_NORMALIZED_OUTPUT:,.0f} to prevent baseline corruption from sensor outages.",
         f"- Days with irradiance below {MIN_IRRADIANCE_FOR_BASELINE:,.0f} W·s/m² are excluded from baseline computation.",
-        "- Soiling baseline uses 95th percentile (rolling 30-day) instead of max for outlier resistance.",
+        "- Performance loss baseline uses 95th percentile (rolling 30-day) instead of max for outlier resistance.",
         "- Use flagged days to drive manual inspection before model training.",
     ]
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -381,7 +403,7 @@ def try_generate_plots(
     fig.savefig(output_dir / "interval_histograms.png", dpi=150)
     plt.close(fig)
 
-    # Normalized output + soiling proxy
+    # Normalized output + performance loss proxy
     df = daily_features.copy()
     df["day"] = pd.to_datetime(df["day"], errors="coerce")
     df = df.sort_values("day")
@@ -400,17 +422,17 @@ def try_generate_plots(
 
     axes[1].plot(
         df["day"],
-        df["soiling_loss_pct_proxy"],
-        label="soiling_loss_pct_proxy",
+        df["performance_loss_pct_proxy"],
+        label="performance_loss_pct_proxy",
         linewidth=1.2,
         color="tab:red",
     )
     axes[1].set_ylabel("%")
-    axes[1].set_title("Soiling Loss Proxy")
+    axes[1].set_title("Performance Loss Proxy")
     axes[1].legend(loc="upper right")
 
     fig.tight_layout()
-    fig.savefig(output_dir / "normalized_output_and_soiling_proxy.png", dpi=150)
+    fig.savefig(output_dir / "normalized_output_and_performance_proxy.png", dpi=150)
     plt.close(fig)
 
     # Availability + imbalance
@@ -442,7 +464,7 @@ def try_generate_plots(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Audit PV telemetry datasets and build daily features for soiling analysis."
+        description="Audit PV telemetry datasets and build daily features for performance analysis."
     )
     parser.add_argument(
         "--data-dir",
@@ -464,6 +486,10 @@ def main() -> None:
         "generation": args.data_dir / "power_generation_2025_to_current_1day_none_si.csv",
     }
 
+    # Solcast files (optional)
+    solcast_soiling_path = args.data_dir / "soiling_2025_to_current_10min_none_std.csv"
+    solcast_irradiance_path = args.data_dir / "irradiance_2025_to_current_10min_none_std.csv"
+
     for name, path in files.items():
         if not path.exists():
             raise FileNotFoundError(f"Missing {name} file at: {path}")
@@ -482,32 +508,78 @@ def main() -> None:
         interval_parts.append(interval_df)
         missing_parts.append(missingness_frame(df, name))
 
+    # Load and aggregate Solcast data (optional -- Solcast CSVs use period_end, not Timestamp/Date)
+    solcast_daily = None
+    if solcast_soiling_path.exists():
+        sc_irr = solcast_irradiance_path if solcast_irradiance_path.exists() else None
+        solcast_daily = aggregate_solcast_daily(solcast_soiling_path, sc_irr)
+        # Add simple profile rows for Solcast datasets
+        import csv
+        with open(solcast_soiling_path, "r") as f:
+            sol_rows = sum(1 for _ in f) - 1  # subtract header
+        profile_rows.append({
+            "dataset": "solcast_soiling",
+            "rows": sol_rows,
+            "columns": 18,
+            "start_date": solcast_daily["day"].min(),
+            "end_date": solcast_daily["day"].max(),
+            "unique_days": len(solcast_daily),
+            "null_date_rows": 0,
+            "median_interval_seconds": 600,
+            "min_interval_seconds": 600,
+            "max_interval_seconds": 600,
+            "expected_interval_seconds": 600,
+            "expected_interval_match_ratio": 1.0,
+            "large_gap_count": 0,
+        })
+        if solcast_irradiance_path.exists():
+            with open(solcast_irradiance_path, "r") as f:
+                irr_rows = sum(1 for _ in f) - 1
+            profile_rows.append({
+                "dataset": "solcast_irradiance",
+                "rows": irr_rows,
+                "columns": 9,
+                "start_date": solcast_daily["day"].min(),
+                "end_date": solcast_daily["day"].max(),
+                "unique_days": len(solcast_daily),
+                "null_date_rows": 0,
+                "median_interval_seconds": 600,
+                "min_interval_seconds": 600,
+                "max_interval_seconds": 600,
+                "expected_interval_seconds": 600,
+                "expected_interval_match_ratio": 1.0,
+                "large_gap_count": 0,
+            })
+        print(f"  Solcast daily features: {len(solcast_daily)} days, {len(solcast_daily.columns)} columns")
+
     profile_df = pd.DataFrame(profile_rows).sort_values("dataset")
     interval_df = pd.concat(interval_parts, ignore_index=True)
     missing_df = pd.concat(missing_parts, ignore_index=True)
 
-    daily_features = build_daily_features(
+    daily_features_df = build_daily_features(
         frames["inverters"],
         frames["irradiance"],
         frames["generation"],
+        solcast_daily,
     )
-    daily_flags = build_daily_flags(daily_features)
+    daily_flags = build_daily_flags(daily_features_df)
 
     profile_df.to_csv(args.out_dir / "dataset_profile.csv", index=False)
     interval_df.to_csv(args.out_dir / "interval_distribution.csv", index=False)
     missing_df.to_csv(args.out_dir / "missingness_by_column.csv", index=False)
-    daily_features.to_csv(args.out_dir / "daily_features.csv", index=False)
+    daily_features_df.to_csv(args.out_dir / "daily_features.csv", index=False)
     daily_flags.to_csv(args.out_dir / "daily_flags.csv", index=False)
 
     write_quality_summary(
         args.out_dir / "quality_summary.md",
         profile_df,
-        daily_features,
+        daily_features_df,
         daily_flags,
     )
-    try_generate_plots(args.out_dir, interval_df, daily_features)
+    try_generate_plots(args.out_dir, interval_df, daily_features_df)
 
     print(f"Audit complete. Outputs written to: {args.out_dir}")
+    print(f"  daily_features.csv: {len(daily_features_df)} rows x {len(daily_features_df.columns)} columns")
 
 
 if __name__ == "__main__":
