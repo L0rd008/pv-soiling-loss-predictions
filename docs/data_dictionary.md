@@ -12,7 +12,7 @@ Reference for raw telemetry, cleaned outputs, and daily modeling features.
 
 ### `inverters_2025_to_current_10min_avg_si.csv`
 
-10-minute AVG inverter telemetry for 8 inverters (subset of 34 total).
+10-minute AVG inverter telemetry for 6 tiered inverters (3 B2 Tier-1 + 3 B1 Tier-2, subset of 34 total).
 
 | Column | Type | Unit | Description |
 |---|---|---|---|

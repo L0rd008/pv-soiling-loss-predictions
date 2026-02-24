@@ -6,7 +6,7 @@ data into daily features used by both the audit and preprocessing pipelines.
 Constants and thresholds are defined here so both consumers stay in sync.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -294,6 +294,54 @@ def aggregate_block_daily(inv: pd.DataFrame, power_cols: List[str]) -> pd.DataFr
     return block_daily
 
 
+def aggregate_tier_daily(
+    inv: pd.DataFrame, power_cols: List[str],
+) -> pd.DataFrame:
+    """Build separate Tier-1 (B2) and Tier-2 (B1) daily energy aggregates.
+
+    Tier-1 (B2-08/13/17): high-availability training signal.
+    Tier-2 (B1-08/01/13): cross-block validation signal.
+
+    Returns a DataFrame with day + t1_*/t2_* columns.
+    Returns empty DataFrame if either tier has no columns.
+    """
+    b1_cols, b2_cols = detect_block_power_cols(power_cols)
+    if not b1_cols and not b2_cols:
+        return pd.DataFrame()
+
+    result_frames = []
+
+    for tier_label, tier_cols in [("t1", b2_cols), ("t2", b1_cols)]:
+        if not tier_cols:
+            continue
+        col_power = f"{tier_label}_power_w"
+        col_energy_step = f"{tier_label}_energy_j_step"
+        col_completeness = f"{tier_label}_completeness"
+
+        inv[col_power] = inv[tier_cols].sum(axis=1, min_count=1)
+        inv[col_energy_step] = inv[col_power] * INVERTER_INTERVAL_S
+        inv[col_completeness] = inv[tier_cols].notna().mean(axis=1)
+
+        tier_daily = (
+            inv.groupby("day")
+            .agg(**{
+                f"{tier_label}_energy_j": (col_energy_step, "sum"),
+                f"{tier_label}_power_w_p95": (col_power, lambda s: s.quantile(0.95)),
+                f"{tier_label}_data_availability": (col_completeness, "mean"),
+            })
+            .reset_index()
+        )
+        result_frames.append(tier_daily)
+
+    if not result_frames:
+        return pd.DataFrame()
+
+    merged = result_frames[0]
+    for extra in result_frames[1:]:
+        merged = merged.merge(extra, on="day", how="outer")
+    return merged
+
+
 def aggregate_irradiance_daily(irr: pd.DataFrame) -> pd.DataFrame:
     """Build daily irradiance sums from cleaned 15-min data.
 
@@ -320,32 +368,54 @@ def aggregate_irradiance_daily(irr: pd.DataFrame) -> pd.DataFrame:
 # Performance loss features
 # ---------------------------------------------------------------------------
 
-def compute_performance_features(daily: pd.DataFrame) -> pd.DataFrame:
+def compute_performance_features(
+    daily: pd.DataFrame,
+    energy_col: str = "subset_energy_j",
+    prefix: Optional[str] = None,
+) -> pd.DataFrame:
     """Add normalized output, rolling baseline, and performance loss proxy.
 
-    Expects columns: ``subset_energy_j``, ``irradiance_tilted_sum``.
-    Modifies ``daily`` in place and returns it.
+    Parameters
+    ----------
+    daily : pd.DataFrame
+        Must contain ``irradiance_tilted_sum`` and the column named by *energy_col*.
+    energy_col : str
+        Column containing daily energy in Joules.
+    prefix : str or None
+        If set (e.g. ``"t1"``), all output columns are prefixed: ``t1_normalized_output``,
+        ``t1_performance_loss_pct_proxy``, etc.  When None, uses the original
+        unprefixed column names for backward compatibility.
 
-    Notes:
+    Notes
+    -----
     - The irradiance guard is applied on DAILY irradiance sum. It does not reject
       normal morning/evening low irradiance records; it protects against days where
       the daily total is implausibly low for baseline building.
     - ``performance_loss_pct_proxy`` is an all-cause proxy deficit against a rolling
       clean-like baseline. It is not a pure-soiling ground truth label.
     """
+    def _col(name: str) -> str:
+        return f"{prefix}_{name}" if prefix else name
+
+    # Skip if energy column is missing or entirely null
+    if energy_col not in daily.columns or daily[energy_col].isna().all():
+        return daily
+
     # Normalized output with irradiance sanity guard
     irradiance_valid = daily["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE
-    daily["normalized_output"] = np.where(
+    daily[_col("normalized_output")] = np.where(
         irradiance_valid,
-        daily["subset_energy_j"] / daily["irradiance_tilted_sum"],
+        daily[energy_col] / daily["irradiance_tilted_sum"],
         np.nan,
     )
-    daily["normalized_output"] = daily["normalized_output"].clip(upper=MAX_NORMALIZED_OUTPUT)
+    daily[_col("normalized_output")] = daily[_col("normalized_output")].clip(
+        upper=MAX_NORMALIZED_OUTPUT
+    )
 
     # 14-day rolling median provides a robust short-term "typical output" reference.
     # Median is less sensitive than mean to spikes/dropouts from telemetry issues.
-    daily["normalized_output_14d_median"] = (
-        daily["normalized_output"].rolling(14, min_periods=5).median()
+    daily[_col("normalized_output_14d_median")] = (
+        daily[_col("normalized_output")].rolling(14, min_periods=5).median()
     )
 
     # Rolling clean baseline: 95th percentile on clear days
@@ -354,21 +424,80 @@ def compute_performance_features(daily: pd.DataFrame) -> pd.DataFrame:
         (daily["irradiance_tilted_sum"] >= clear_day_threshold)
         & (daily["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE)
     )
-    baseline_src = daily["normalized_output"].where(clear_day_mask)
-    daily["rolling_clean_baseline"] = (
+    baseline_src = daily[_col("normalized_output")].where(clear_day_mask)
+    daily[_col("rolling_clean_baseline")] = (
         baseline_src.rolling(30, min_periods=7).quantile(0.95).ffill()
     )
 
     # Performance loss proxy (all-cause deficit vs rolling clean baseline)
-    daily["performance_loss_pct_proxy"] = (
-        100.0 * (1.0 - (daily["normalized_output"] / daily["rolling_clean_baseline"]))
+    daily[_col("performance_loss_pct_proxy")] = (
+        100.0 * (1.0 - (
+            daily[_col("normalized_output")] / daily[_col("rolling_clean_baseline")]
+        ))
     ).clip(lower=0, upper=100)
 
     # Performance loss rate (trend feature for cleaning predictions)
-    daily["perf_loss_rate_14d_pct_per_day"] = (
-        (daily["performance_loss_pct_proxy"] - daily["performance_loss_pct_proxy"].shift(14)) / 14.0
+    daily[_col("perf_loss_rate_14d_pct_per_day")] = (
+        (
+            daily[_col("performance_loss_pct_proxy")]
+            - daily[_col("performance_loss_pct_proxy")].shift(14)
+        )
+        / 14.0
     )
 
+    return daily
+
+
+def compute_cross_block_correlation(daily: pd.DataFrame) -> pd.DataFrame:
+    """Add cross-block correlation between Tier-1 and Tier-2 performance loss.
+
+    Requires ``t1_performance_loss_pct_proxy`` and ``t2_performance_loss_pct_proxy``
+    to be present (computed via prefixed ``compute_performance_features`` calls).
+
+    Modifies ``daily`` in place and returns it.
+    """
+    t1_col = "t1_performance_loss_pct_proxy"
+    t2_col = "t2_performance_loss_pct_proxy"
+
+    if t1_col not in daily.columns or t2_col not in daily.columns:
+        return daily
+
+    # Rolling 30-day Pearson correlation (requires both tiers to have data)
+    daily["tier_loss_correlation"] = (
+        daily[t1_col].rolling(30, min_periods=10).corr(daily[t2_col])
+    )
+
+    # Delta: positive means B2 (Tier-1) shows lower loss (cleaner / better signal)
+    daily["tier_loss_delta"] = daily[t1_col] - daily[t2_col]
+
+    # Directional agreement: both tiers trending same direction over 7 days
+    t1_trend = daily[t1_col].diff(7)
+    t2_trend = daily[t2_col].diff(7)
+    daily["tier_agreement_flag"] = (
+        (t1_trend > 0) & (t2_trend > 0)
+    ) | (
+        (t1_trend < 0) & (t2_trend < 0)
+    )
+
+    return daily
+
+
+def compute_common_overlap(daily: pd.DataFrame) -> pd.DataFrame:
+    """Mark days that have non-null data from all three core sources.
+
+    Uses ``notna()`` — a day with zero energy/irradiance is still structurally
+    present data; the ``> 0`` guard belonged in quality flags, not overlap.
+
+    Adds ``in_common_overlap`` boolean column.
+    Modifies ``daily`` in place and returns it.
+    """
+    has_inverter = daily["subset_energy_j"].notna()
+    has_irradiance = daily["irradiance_tilted_sum"].notna()
+    has_generation = False
+    if "daily_generation_j" in daily.columns:
+        has_generation = daily["daily_generation_j"].notna()
+
+    daily["in_common_overlap"] = has_inverter & has_irradiance & has_generation
     return daily
 
 
@@ -379,13 +508,23 @@ def compute_performance_features(daily: pd.DataFrame) -> pd.DataFrame:
 def compute_quality_flags(daily: pd.DataFrame) -> pd.DataFrame:
     """Add quality flags to the daily table.
 
+    Training-facing flags preferentially use Tier-1 (B2) fields so that
+    B1 gaps don't inflate flag counts on training-ready days.
+
     Modifies ``daily`` in place and returns it.
     """
+    # Select best-available energy/availability columns (Tier-1 preferred)
+    energy_col = "t1_energy_j" if "t1_energy_j" in daily.columns else "subset_energy_j"
+    avail_col = (
+        "t1_data_availability" if "t1_data_availability" in daily.columns
+        else "subset_data_availability_mean"
+    )
+
     # Sensor-suspect irradiance: low irradiance but non-trivial inverter output
     daily["flag_sensor_suspect_irradiance"] = (
         (daily["irradiance_tilted_sum"] < MIN_IRRADIANCE_FOR_BASELINE)
-        & (daily["subset_energy_j"] > 0)
-        & (daily["subset_data_availability_mean"] > 0.30)
+        & (daily[energy_col] > 0)
+        & (daily[avail_col] > 0.30 if avail_col in daily.columns else True)
     )
 
     # Coverage gap: less than 30% of expected records (lenient to avoid overcounting)
@@ -408,12 +547,17 @@ def compute_quality_flags(daily: pd.DataFrame) -> pd.DataFrame:
     else:
         daily["flag_block_mismatch"] = False
 
-    # Low output under high irradiance
-    if "normalized_output_14d_median" in daily.columns:
+    # Low output under high irradiance — use Tier-1 normalized output
+    norm_col = "t1_normalized_output" if "t1_normalized_output" in daily.columns else "normalized_output"
+    norm_14d_col = (
+        "t1_normalized_output_14d_median" if "t1_normalized_output_14d_median" in daily.columns
+        else "normalized_output_14d_median"
+    )
+    if norm_14d_col in daily.columns:
         irr_high = daily["irradiance_tilted_sum"].quantile(0.60)
         daily["flag_low_output_high_irr"] = (
             (daily["irradiance_tilted_sum"] >= irr_high)
-            & (daily["normalized_output"] < 0.70 * daily["normalized_output_14d_median"])
+            & (daily[norm_col] < 0.70 * daily[norm_14d_col])
         )
     else:
         daily["flag_low_output_high_irr"] = False
@@ -428,6 +572,9 @@ def compute_quality_flags(daily: pd.DataFrame) -> pd.DataFrame:
 def compute_transfer_readiness(daily: pd.DataFrame) -> pd.DataFrame:
     """Add transfer quality score, tier, and cross-plant readiness flag.
 
+    Uses Tier-1 (B2) fields for scoring when available so that B1 data gaps
+    don't artificially depress training-data quality scores.
+
     Scoring: start at 100, subtract penalties for quality issues.
     Modifies ``daily`` in place and returns it.
     """
@@ -439,16 +586,24 @@ def compute_transfer_readiness(daily: pd.DataFrame) -> pd.DataFrame:
     # Penalty: sensor suspect (irradiance unreliable)
     score -= np.where(daily.get("flag_sensor_suspect_irradiance", False), 30.0, 0.0)
 
-    # Penalty: low data availability
-    if "subset_data_availability_mean" in daily.columns:
-        score -= np.where(daily["subset_data_availability_mean"] < 0.50, 20.0, 0.0)
+    # Penalty: low data availability (prefer Tier-1 availability)
+    avail_col = (
+        "t1_data_availability" if "t1_data_availability" in daily.columns
+        else "subset_data_availability_mean"
+    )
+    if avail_col in daily.columns:
+        score -= np.where(daily[avail_col] < 0.50, 20.0, 0.0)
 
     # Penalty: block mismatch
     score -= np.where(daily.get("flag_block_mismatch", False), 10.0, 0.0)
 
-    # Penalty: missing performance loss proxy
-    if "performance_loss_pct_proxy" in daily.columns:
-        score -= np.where(daily["performance_loss_pct_proxy"].isna(), 15.0, 0.0)
+    # Penalty: missing performance loss proxy (prefer Tier-1 proxy)
+    loss_col = (
+        "t1_performance_loss_pct_proxy" if "t1_performance_loss_pct_proxy" in daily.columns
+        else "performance_loss_pct_proxy"
+    )
+    if loss_col in daily.columns:
+        score -= np.where(daily[loss_col].isna(), 15.0, 0.0)
 
     daily["transfer_quality_score"] = np.clip(score, 0.0, 100.0)
 

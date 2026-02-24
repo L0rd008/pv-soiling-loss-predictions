@@ -3,7 +3,7 @@
 Reads the existing inverter CSV and the candidate B1 CSV, then produces:
 
 1. Primary file (Tier 1+2): B2-08, B2-13, B2-17, B1-08, B1-01, B1-13
-   → data/inverters_2025_to_current_10min_avg_si.csv (overwrites)
+   → data/inverters_tiered_primary_10min.csv
    Adds a 'tier' column: 1 for B2 training set, 2 for B1 validation set.
 
 2. Secondary file: B1-04, B1-05, B1-12, B1-16, B1-17, B2-04
@@ -83,7 +83,7 @@ def main() -> None:
     primary.loc[has_t1, "tier"] = 1
     primary.loc[~has_t1 & has_t2, "tier"] = 2
 
-    out_primary = EXISTING_CSV  # overwrite existing
+    out_primary = DATA_DIR / "inverters_tiered_primary_10min.csv"
     primary.to_csv(out_primary, index=False)
     print(f"\n  PRIMARY saved: {out_primary}")
     print(f"    {len(primary)} rows, {len(primary.columns)} cols")

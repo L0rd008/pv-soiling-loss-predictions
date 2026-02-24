@@ -5,7 +5,7 @@ This repository is for building AI/ML workflows that help PV stakeholders detect
 Current plant context:
 - Plant size: ~10-15 MW
 - Inverters in plant: 34
-- Inverters in this dataset: 8 (4 from block `B1`, 4 from block `B2`)
+- Inverters in this dataset: 6 tiered (3 B2 Tier-1 training + 3 B1 Tier-2 validation) + 6 secondary
 - Data source: ThingsBoard telemetry exports
 
 Operational cleaning context (this plant):
@@ -61,7 +61,7 @@ Event-log schema for future supervised labels is documented in
 1. `data/inverters_2025_to_current_10min_avg_si.csv`
 - 10-minute aggregated inverter telemetry (`AVG`).
 - Power and phase currents (SI units).
-- 8 inverters sampled.
+- 6 tiered inverters: 3 B2 Tier-1 (training) + 3 B1 Tier-2 (validation), plus 6 secondary.
 
 2. `data/irradiance_2025_to_current_15min_sum_si.csv`
 - 15-minute weather station telemetry (`SUM`).
@@ -78,7 +78,7 @@ Event-log schema for future supervised labels is documented in
 - Sampling gaps exist due to connectivity/device issues and nighttime no-sun periods.
 - Invalid or missing values exist (NaNs/empties/possible fallback substitutions).
 - The generation file has multiple records per day and irregular intervals.
-- Inverter file includes only a subset (8/34) of plant inverters; direct plant-level comparisons must account for this.
+- Inverter file includes only a tiered subset (6/34) of plant inverters; direct plant-level comparisons must account for this.
 
 ## Repository Workflow
 

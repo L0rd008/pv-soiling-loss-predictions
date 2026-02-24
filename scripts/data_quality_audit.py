@@ -17,6 +17,9 @@ from daily_features import (
     EXPECTED_IRR_RECORDS_PER_DAY,
     detect_block_power_cols as block_power_columns,
     aggregate_solcast_daily,
+    aggregate_tier_daily,
+    compute_common_overlap,
+    compute_cross_block_correlation,
     compute_performance_features,
     compute_quality_flags as _shared_quality_flags,
 )
@@ -256,9 +259,23 @@ def build_daily_features(
         daily["block_mismatch_ratio_rolling_median"] = (
             daily["block_mismatch_ratio"].rolling(14, min_periods=5).median()
         )
+    # --- Tier-1 / Tier-2 daily aggregation ---
+    tier_daily = aggregate_tier_daily(inv, power_cols)
+    if not tier_daily.empty:
+        tier_daily.index = pd.to_datetime(tier_daily["day"], errors="coerce")
+        tier_daily = tier_daily.drop(columns=["day"])
+        daily = daily.join(tier_daily, how="left")
 
     # --- Performance loss features (shared logic) ---
+    # Combined (backward compat)
     daily = compute_performance_features(daily)
+    # Tier-1 (B2 training signal)
+    daily = compute_performance_features(daily, energy_col="t1_energy_j", prefix="t1")
+    # Tier-2 (B1 validation signal)
+    daily = compute_performance_features(daily, energy_col="t2_energy_j", prefix="t2")
+
+    # --- Cross-block correlation ---
+    daily = compute_cross_block_correlation(daily)
 
     # --- Merge Solcast environmental features ---
     # Always reset the day index to a column first
@@ -273,6 +290,9 @@ def build_daily_features(
         solcast_daily = solcast_daily.copy()
         solcast_daily["day"] = pd.to_datetime(solcast_daily["day"], errors="coerce")
         daily = daily.merge(solcast_daily, on="day", how="left")
+
+    # --- Common-overlap window ---
+    daily = compute_common_overlap(daily)
 
     return daily
 
@@ -366,7 +386,7 @@ def write_quality_summary(
     ] + block_lines + [
         "",
         "## Notes",
-        "- Plant-level generation is compared against only 8 sampled inverters, so ratio scaling should be interpreted with context.",
+        "- Plant-level generation is compared against only 6 tiered inverters (3 B2 Tier-1 + 3 B1 Tier-2), so ratio scaling should be interpreted with context.",
         "- Generation feed has multiple intraday points and should be treated as event telemetry, not strictly one row per day.",
         f"- Normalized output values capped at {MAX_NORMALIZED_OUTPUT:,.0f} to prevent baseline corruption from sensor outages.",
         f"- Days with irradiance below {MIN_IRRADIANCE_FOR_BASELINE:,.0f} W·s/m² are excluded from baseline computation.",
@@ -480,8 +500,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Prefer tiered primary file if it exists, fall back to raw fetch output
+    tiered_inv = args.data_dir / "inverters_tiered_primary_10min.csv"
+    raw_inv = args.data_dir / "inverters_2025_to_current_10min_avg_si.csv"
     files = {
-        "inverters": args.data_dir / "inverters_2025_to_current_10min_avg_si.csv",
+        "inverters": tiered_inv if tiered_inv.exists() else raw_inv,
         "irradiance": args.data_dir / "irradiance_2025_to_current_15min_sum_si.csv",
         "generation": args.data_dir / "power_generation_2025_to_current_1day_none_si.csv",
     }

@@ -1,8 +1,7 @@
-"""Compare daily data availability for all 8 B1 inverters vs B2.
+"""Compare daily data availability for all fetched B1 and B2 inverters.
 
-Reads the existing inverter CSV (8 inverters) and the candidate CSV (4 B1
-candidates fetched separately), computes per-inverter daily availability,
-and produces a ranked report.
+Reads the existing tiered primary CSV and the candidate B1 CSV, computes
+per-inverter daily availability, and produces a ranked report.
 
 Usage::
 
@@ -19,9 +18,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Inverter sets
-CURRENT_B1_SET = {"B1-04", "B1-08", "B1-13", "B1-17"}
-CANDIDATE_B1_SET = {"B1-01", "B1-05", "B1-12", "B1-16"}
+# Inverter sets — finalized tiered selection
+PRIMARY_B1 = {"B1-08", "B1-01", "B1-13"}      # Tier-2 (validation)
+PRIMARY_B2 = {"B2-08", "B2-13", "B2-17"}       # Tier-1 (training)
+SECONDARY_B1 = {"B1-04", "B1-05", "B1-12", "B1-16", "B1-17"}
+SECONDARY_B2 = {"B2-04"}
 
 # Expected 10-min records per day (24h × 6 = 144)
 EXPECTED_RECORDS_PER_DAY = 144
@@ -65,12 +66,14 @@ def load_and_compute_availability(csv_path: Path) -> pd.DataFrame:
 
 
 def label_set(inv_name: str) -> str:
-    if inv_name in CURRENT_B1_SET:
-        return "current-B1"
-    elif inv_name in CANDIDATE_B1_SET:
-        return "candidate-B1"
+    if inv_name in PRIMARY_B2:
+        return "Tier-1 (B2 training)"
+    elif inv_name in PRIMARY_B1:
+        return "Tier-2 (B1 validation)"
+    elif inv_name in SECONDARY_B1 or inv_name in SECONDARY_B2:
+        return "secondary"
     else:
-        return "B2-baseline"
+        return "unknown"
 
 
 def write_report(output_path: Path, avail_df: pd.DataFrame) -> None:
@@ -79,13 +82,13 @@ def write_report(output_path: Path, avail_df: pd.DataFrame) -> None:
     avail_df["set"] = avail_df["inverter"].apply(label_set)
 
     lines = [
-        "# B1 Inverter Availability Comparison",
+        "# Inverter Availability Comparison",
         "",
-        "Comparison of all 8 B1 inverters plus 4 B2 inverters (baseline).",
+        "Availability comparison across all fetched inverters.",
         "",
-        "- **Current B1 set**: B1-04, B1-08, B1-13, B1-17",
-        "- **Candidate B1 alternates**: B1-01, B1-05, B1-12, B1-16",
-        "- **B2 baseline**: B2-04, B2-08, B2-13, B2-17",
+        "- **Tier-1 (B2 training)**: B2-08, B2-13, B2-17",
+        "- **Tier-2 (B1 validation)**: B1-08, B1-01, B1-13",
+        "- **Secondary (reserve)**: B1-04, B1-05, B1-12, B1-16, B1-17, B2-04",
         "",
     ]
 
@@ -179,28 +182,23 @@ def write_report(output_path: Path, avail_df: pd.DataFrame) -> None:
     if perfect:
         lines.append(f"\nInverters with zero low-availability days: {', '.join(sorted(perfect))}")
 
-    # --- Best-4 recommendation ---
-    b1_ranked = inv_summary[inv_summary["set"].isin(["current-B1", "candidate-B1"])].copy()
-    best_4 = b1_ranked.head(4)["inverter"].tolist()
+    # --- Tier summary ---
+    tier1_invs = inv_summary[inv_summary["set"] == "Tier-1 (B2 training)"].copy()
+    tier2_invs = inv_summary[inv_summary["set"] == "Tier-2 (B1 validation)"].copy()
 
     lines += [
         "",
-        "## Recommendation: Best 4 B1 Inverters by Availability",
-        "",
-        f"Top 4: **{', '.join(best_4)}**",
+        "## Finalized Tier Selection Validation",
         "",
     ]
-
-    if set(best_4) == CURRENT_B1_SET:
-        lines.append("**Verdict**: Current B1 set is already optimal. No swap needed.")
-    elif set(best_4) == CANDIDATE_B1_SET:
-        lines.append("**Verdict**: Full swap — all candidates have better availability.")
-    else:
-        swaps_out = CURRENT_B1_SET - set(best_4)
-        swaps_in = set(best_4) - CURRENT_B1_SET
-        lines.append("**Verdict**: Partial swap recommended.")
-        lines.append(f"- Remove: {', '.join(sorted(swaps_out))}")
-        lines.append(f"- Add: {', '.join(sorted(swaps_in))}")
+    if not tier1_invs.empty:
+        t1_mean = tier1_invs["mean"].mean()
+        lines.append(f"- Tier-1 avg availability: **{t1_mean:.3f}**")
+    if not tier2_invs.empty:
+        t2_mean = tier2_invs["mean"].mean()
+        lines.append(f"- Tier-2 avg availability: **{t2_mean:.3f}**")
+    if not tier1_invs.empty and not tier2_invs.empty:
+        lines.append(f"- Tier-1 / Tier-2 ratio: **{t1_mean / t2_mean:.2f}x**")
 
     lines.append("")
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -240,9 +238,15 @@ def main() -> None:
     candidates = load_and_compute_availability(args.candidate_csv)
     print(f"  {len(candidates)} day-records from {candidates['inverter'].nunique()} inverters")
 
-    # Combine
+    # Combine and deduplicate overlapping inverters (e.g. B1-01 may appear
+    # in both files after re-fetch).  Keep the row with more valid_records.
     all_avail = pd.concat([existing, candidates], ignore_index=True)
-    all_avail = all_avail.sort_values(["inverter", "day"]).reset_index(drop=True)
+    all_avail = all_avail.sort_values(
+        ["inverter", "day", "valid_records"], ascending=[True, True, False]
+    )
+    all_avail = all_avail.drop_duplicates(
+        subset=["inverter", "day"], keep="first"
+    ).reset_index(drop=True)
 
     # Save
     all_avail.to_csv(args.out_dir / "b1_all_availability.csv", index=False)

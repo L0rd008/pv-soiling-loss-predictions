@@ -26,6 +26,9 @@ from daily_features import (
     aggregate_inverter_daily,
     aggregate_irradiance_daily,
     aggregate_solcast_daily,
+    aggregate_tier_daily,
+    compute_common_overlap,
+    compute_cross_block_correlation,
     compute_quality_flags,
     compute_performance_features,
     compute_transfer_readiness,
@@ -174,18 +177,29 @@ def build_daily_model_table(
 
     Uses shared feature functions from ``daily_features`` module for performance
     flags, and transfer readiness to stay in sync with the audit pipeline.
+
+    Produces three sets of performance features:
+    - Combined (all inverters): backward-compatible ``performance_loss_pct_proxy``
+    - Tier-1 (B2 training): ``t1_performance_loss_pct_proxy``
+    - Tier-2 (B1 validation): ``t2_performance_loss_pct_proxy``
+    Plus cross-block correlation columns.
     """
     inv = inverters.copy()
     irr = irradiance.copy()
     gen = generation_daily.copy()
 
-    # --- Inverter daily aggregation ---
+    # --- Inverter daily aggregation (combined) ---
     inv_daily, power_cols = aggregate_inverter_daily(inv)
 
     # --- Block (B1 vs B2) daily aggregation ---
     block_daily = aggregate_block_daily(inv, power_cols)
     if not block_daily.empty:
         inv_daily = inv_daily.merge(block_daily, on="day", how="left")
+
+    # --- Tier-1 / Tier-2 daily aggregation ---
+    tier_daily = aggregate_tier_daily(inv, power_cols)
+    if not tier_daily.empty:
+        inv_daily = inv_daily.merge(tier_daily, on="day", how="left")
 
     # --- Irradiance daily aggregation ---
     irr_daily = aggregate_irradiance_daily(irr)
@@ -209,8 +223,19 @@ def build_daily_model_table(
         daily["generation_mwh"] / daily["subset_energy_mwh"]
     )
 
-    # --- Performance loss features (shared logic) ---
+    # --- Performance loss features ---
+    # Combined (backward compat) — uses all-inverter subset_energy_j
     daily = compute_performance_features(daily)
+    # Tier-1 (B2 training signal)
+    daily = compute_performance_features(daily, energy_col="t1_energy_j", prefix="t1")
+    # Tier-2 (B1 validation signal)
+    daily = compute_performance_features(daily, energy_col="t2_energy_j", prefix="t2")
+
+    # --- Cross-block correlation ---
+    daily = compute_cross_block_correlation(daily)
+
+    # --- Common-overlap window ---
+    daily = compute_common_overlap(daily)
 
     # --- Quality flags (shared logic) ---
     daily = compute_quality_flags(daily)
@@ -269,8 +294,10 @@ def write_preprocessing_summary(
         "# Preprocessing Summary",
         "",
         "## Scope",
-        "- Source context: single 10-15 MW plant dataset (8 sampled inverters out of 34 total).",
+        "- Source context: single 10-15 MW plant dataset (6 tiered inverters: 3 B2 Tier-1 + 3 B1 Tier-2, out of 34 total).",
         "- Intended use: build features that can inform cross-plant inference with quality gating.",
+        "- Tier-1 (training): B2-08, B2-13, B2-17 (~93-95% availability)",
+        "- Tier-2 (validation): B1-08, B1-01, B1-13 (~54% availability)",
         "",
         "## Cleaning Statistics",
         f"- Inverters rows: {int(inv_stats['rows'])}",
@@ -328,9 +355,19 @@ def main() -> None:
         default=Path("artifacts/preprocessed"),
         help="Output directory for cleaned/preprocessed files.",
     )
+    parser.add_argument(
+        "--trim-to-overlap",
+        action="store_true",
+        default=False,
+        help="If set, daily_model_input.csv is trimmed to common-overlap days only.",
+    )
     args = parser.parse_args()
 
-    inverters_path = args.data_dir / "inverters_2025_to_current_10min_avg_si.csv"
+    # Prefer tiered primary file if it exists (produced by split_inverter_tiers.py),
+    # otherwise fall back to the original raw fetch output.
+    tiered_path = args.data_dir / "inverters_tiered_primary_10min.csv"
+    raw_path = args.data_dir / "inverters_2025_to_current_10min_avg_si.csv"
+    inverters_path = tiered_path if tiered_path.exists() else raw_path
     irradiance_path = args.data_dir / "irradiance_2025_to_current_15min_sum_si.csv"
     generation_path = args.data_dir / "power_generation_2025_to_current_1day_none_si.csv"
 
@@ -361,7 +398,20 @@ def main() -> None:
     irr_clean.to_csv(args.out_dir / "irradiance_clean.csv", index=False)
     gen_clean.to_csv(args.out_dir / "generation_clean.csv", index=False)
     gen_daily.to_csv(args.out_dir / "generation_daily_clean.csv", index=False)
+
+    # Optionally trim the primary output to overlap-valid days
+    if args.trim_to_overlap and "in_common_overlap" in daily_model.columns:
+        trimmed = len(daily_model) - daily_model["in_common_overlap"].sum()
+        daily_model = daily_model[daily_model["in_common_overlap"]].copy()
+        print(f"  --trim-to-overlap: removed {trimmed} non-overlap days")
+
     daily_model.to_csv(args.out_dir / "daily_model_input.csv", index=False)
+
+    # Always produce a trimmed EDA convenience table
+    if "in_common_overlap" in daily_model.columns:
+        eda_table = daily_model[daily_model["in_common_overlap"]].copy()
+        eda_table.to_csv(args.out_dir / "daily_model_eda.csv", index=False)
+        print(f"  daily_model_eda.csv: {len(eda_table)} rows (overlap-filtered)")
 
     write_preprocessing_summary(
         args.out_dir / "preprocessing_summary.md",
