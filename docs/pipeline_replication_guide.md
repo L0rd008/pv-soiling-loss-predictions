@@ -7,6 +7,7 @@ Detailed stage guides:
 1. `docs/pipeline_replication/01_fetching.md`
 2. `docs/pipeline_replication/02_cleaning_preprocessing.md`
 3. `docs/pipeline_replication/03_audit_validation.md`
+4. `docs/pipeline_replication/04_eda_guide_daily_model_eda.md`
 
 ## Why This Is Split
 
