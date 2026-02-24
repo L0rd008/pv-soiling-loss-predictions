@@ -1,0 +1,6 @@
+event_id,event_type,scope,scope_id,start_date,end_date,coverage_type,source,confidence,notes
+evt_clean_2025_09,cleaning,plant,plant,2025-09-20,2025-09-30,partial,manual_report,medium,Plant cleaning campaign window reported; full per-row completion log unavailable.
+evt_clean_2025_10,cleaning,plant,plant,2025-10-20,2025-10-30,partial,manual_report,medium,Plant cleaning campaign window reported; full per-row completion log unavailable.
+evt_clean_2025_11,cleaning,plant,plant,2025-11-20,2025-11-30,partial,manual_report,medium,Plant cleaning campaign window reported; full per-row completion log unavailable.
+evt_no_clean_2025_12,no_cleaning,plant,plant,2025-12-01,2025-12-31,partial,manual_report,medium,No cleaning reported for December 2025.
+evt_no_clean_2026_01,no_cleaning,plant,plant,2026-01-01,2026-01-31,partial,manual_report,medium,No cleaning reported for January 2026.

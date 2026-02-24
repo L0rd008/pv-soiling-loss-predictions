@@ -8,6 +8,10 @@ into quality-gated daily features for:
 - anomaly detection,
 - cross-plant inference support.
 
+Constraint:
+- This stage is for data quality and preprocessing, not final causal attribution.
+- `performance_loss_pct_proxy` is a monitoring proxy, not a ground-truth soiling label.
+
 ## Scope
 
 Input files:
@@ -53,6 +57,13 @@ Output files:
 - performance loss proxy percentage.
 - B1/B2 mismatch metrics.
 
+Design rationale:
+- Low daily irradiance totals are excluded from baseline construction to avoid
+  sensor-outage corruption.
+- 14-day rolling median is used for short-term typical output because it is robust
+  to spikes/dropouts; mean is more sensitive to outliers.
+- Baseline uses rolling 95th percentile instead of max for outlier resistance.
+
 6. Transfer-readiness gating
 - Sensor and coverage flags.
 - Block mismatch flag.
@@ -65,3 +76,12 @@ Output files:
 - `performance_loss_pct_proxy` remains in `[0, 100]`.
 - `normalized_output` is capped to prevent outlier corruption.
 - transfer readiness fields are populated.
+
+## Operational Context To Consider During Analysis
+
+- Cleaning campaigns at this plant were reported in late Sep/Oct/Nov 2025.
+- Cleaning progresses over ~10-30 days across the plant, so recoveries may be
+  gradual through the window.
+- See `docs/domain_context_and_concern_resolution.md` for concern-by-concern handling.
+- Use `docs/templates/canonical_event_log.csv` to record cleaning/outage/maintenance
+  windows for downstream label generation (coverage can be marked `partial`).

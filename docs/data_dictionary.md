@@ -51,7 +51,7 @@ Asset-level generation feed (`agg=NONE`) with irregular intraday records.
 | `Energy Meter Daily Generation (J)` | float | J | Converted generation value |
 
 Unit note:
-- `energymeter_dailygeneration` is treated as kWh and converted as `kWh * 3,600,000 = J`.
+- `EnergyMeter_dailyGeneration` is treated as kWh and converted as `kWh * 3,600,000 = J`.
 
 ## Preprocessing Outputs (`artifacts/preprocessed/`)
 
@@ -95,6 +95,11 @@ Daily generation view derived from raw generation telemetry.
 ### `daily_model_input.csv`
 
 Daily modeling table for training, monitoring, and cross-plant transfer gating.
+
+Interpretation:
+- `performance_loss_pct_proxy` is an all-cause proxy (not a direct soiling label).
+- Use quality flags and operational context before treating high-loss days as
+  soiling-only events.
 
 Core fields:
 - `subset_energy_j`

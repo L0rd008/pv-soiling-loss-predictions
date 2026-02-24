@@ -1,7 +1,7 @@
 """Fetch daily power generation telemetry from ThingsBoard.
 
 Pulls raw (``agg=NONE``) asset-level generation data.  The ThingsBoard key
-``energymeter_dailygeneration`` stores values in **kWh**.  This script converts
+``EnergyMeter_dailyGeneration`` stores values in **kWh**.  This script converts
 them to SI Joules::
 
     joules = raw_kWh × 1000 (→ Wh) × 3600 (→ J) = raw_kWh × 3,600,000

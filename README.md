@@ -8,6 +8,14 @@ Current plant context:
 - Inverters in this dataset: 8 (4 from block `B1`, 4 from block `B2`)
 - Data source: ThingsBoard telemetry exports
 
+Operational cleaning context (this plant):
+- Cleaning campaigns were reported for `2025-09-20..2025-09-30`,
+  `2025-10-20..2025-10-30`, and `2025-11-20..2025-11-30`.
+- No cleaning was reported for `2025-12` and `2026-01`.
+- Full-site washing is progressive and can take ~10-30 days end-to-end.
+- Interpretation note: recovery in daily performance metrics may be gradual during
+  wash windows, not a one-day step.
+
 ## Cross-Plant Inference Context
 
 This repository is trained and validated on one plant, but the objective is to
@@ -19,6 +27,11 @@ Practical implications:
 - Always quality-gate daily records before cross-plant use.
 - Recalibrate thresholds per target plant (orientation, DC/AC ratio, clipping).
 - Separate plant-specific KPIs from generally transferable patterns.
+
+Detailed assumptions and concern handling are documented in
+`docs/domain_context_and_concern_resolution.md`.
+Event-log schema for future supervised labels is documented in
+`docs/canonical_event_table.md`.
 
 ## Stakeholder-Focused Outcomes
 
@@ -90,6 +103,7 @@ Additional optional controls:
 - `TB_OUTPUT_DIR`: export location for fetched CSV files (default `data`).
 - `TB_REQUEST_TIMEOUT_S`: HTTP timeout for ThingsBoard calls (default `30`).
 - `TB_GEN_MAX_J`: upper sanity threshold for generation values in Joules.
+- `TB_GEN_KEYS`: generation key list (confirmed key: `EnergyMeter_dailyGeneration`).
 
 ## Data Quality + EDA Script
 
@@ -156,6 +170,10 @@ Outputs (under `artifacts/preprocessed/`):
 - Inverter health score (availability, variability, imbalance, anomaly counts).
 - Sensor consistency score (horizontal vs tilted irradiance coherence).
 - Recoverable-energy estimate for prioritized maintenance actions.
+
+Important interpretation note:
+- `performance_loss_pct_proxy` is an all-cause performance deficit proxy versus a
+  rolling clean-like baseline. It is not a ground-truth soiling label by itself.
 
 ## Engineering Notes
 

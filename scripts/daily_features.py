@@ -325,6 +325,13 @@ def compute_performance_features(daily: pd.DataFrame) -> pd.DataFrame:
 
     Expects columns: ``subset_energy_j``, ``irradiance_tilted_sum``.
     Modifies ``daily`` in place and returns it.
+
+    Notes:
+    - The irradiance guard is applied on DAILY irradiance sum. It does not reject
+      normal morning/evening low irradiance records; it protects against days where
+      the daily total is implausibly low for baseline building.
+    - ``performance_loss_pct_proxy`` is an all-cause proxy deficit against a rolling
+      clean-like baseline. It is not a pure-soiling ground truth label.
     """
     # Normalized output with irradiance sanity guard
     irradiance_valid = daily["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE
@@ -335,6 +342,8 @@ def compute_performance_features(daily: pd.DataFrame) -> pd.DataFrame:
     )
     daily["normalized_output"] = daily["normalized_output"].clip(upper=MAX_NORMALIZED_OUTPUT)
 
+    # 14-day rolling median provides a robust short-term "typical output" reference.
+    # Median is less sensitive than mean to spikes/dropouts from telemetry issues.
     daily["normalized_output_14d_median"] = (
         daily["normalized_output"].rolling(14, min_periods=5).median()
     )
