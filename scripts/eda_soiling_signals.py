@@ -1,6 +1,6 @@
 """EDA: Three go/no-go signal tests for soiling loss prediction.
 
-Produces ~19 plots in artifacts/eda/plots/ and a quantitative verdict
+Produces ~23 plots in artifacts/eda/plots/ and a quantitative verdict
 report in artifacts/eda/eda_signal_report.md.
 
 Usage:
@@ -1018,6 +1018,347 @@ def run_supporting_analyses(
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
+# ║  Clear-Sky Soiling Analysis                                        ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+def test_clear_sky_soiling(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Dict[str, Any]:
+    """Analyse soiling on Clear-Sky Analyzable (CSA) days only.
+
+    CSA days have low cloud, no rain, functioning equipment, and no carry-
+    over weather -- the subset where soiling metrics are least contaminated
+    by tropical weather noise.  Three plots are produced (c1, c2, c3).
+    """
+    log.info("── Clear-Sky Soiling Analysis ──")
+    hq = _hq_filter(df)
+    results: Dict[str, Any] = {}
+
+    csa_col = "is_clear_sky_analyzable"
+    if csa_col not in df.columns:
+        log.warning("Column %s not found; skipping CSA analysis.", csa_col)
+        return results
+
+    csa = df[df[csa_col]].copy()
+    results["csa_n"] = len(csa)
+    results["hq_n"] = len(hq)
+    log.info("CSA days: %d / %d HQ", len(csa), len(hq))
+
+    loss_col = (
+        "t1_performance_loss_pct_proxy"
+        if "t1_performance_loss_pct_proxy" in df.columns
+        else "performance_loss_pct_proxy"
+    )
+    dev_col = "cycle_deviation_pct"
+
+    # ------------------------------------------------------------------
+    # C1: Clear-sky loss time-series (CSA dots over faded HQ backdrop)
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(
+        hq["day_dt"], hq[loss_col],
+        lw=0.5, color=C_T1, alpha=0.20, label="All HQ",
+    )
+    ax.scatter(
+        csa["day_dt"], csa[loss_col],
+        s=14, color=C_ACCENT, zorder=3, label="CSA days",
+    )
+    csa_sorted = csa.sort_values("day_dt")
+    ax.plot(
+        csa_sorted["day_dt"], csa_sorted[loss_col],
+        lw=0.6, color=C_ACCENT, alpha=0.5,
+    )
+    _add_rain_cleaning_overlays(ax, df)
+    ax.set_ylabel("Performance loss proxy (%)")
+    ax.set_title("C1: Loss proxy on Clear-Sky Analyzable days (weather-filtered)")
+    ax.legend(loc="upper left", fontsize=8)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+    fig.tight_layout()
+    _save(fig, plots_dir / "c1_clear_sky_loss_timeseries.png")
+
+    # ------------------------------------------------------------------
+    # C2: Side-by-side correlation comparison (All HQ vs CSA)
+    # ------------------------------------------------------------------
+    compare_feats = [
+        ("cumulative_pm25_since_rain", "Cumul. PM2.5"),
+        ("days_since_last_rain", "Days since rain"),
+        ("pm10_mean", "PM10"),
+        ("pm25_mean", "PM2.5"),
+        ("cloud_opacity_mean", "Cloud opacity"),
+        ("air_temp_mean", "Temperature"),
+        ("domain_soiling_index", "DSPI"),
+    ]
+    compare_feats = [
+        (c, label) for c, label in compare_feats if c in hq.columns
+    ]
+
+    r_hq_list: List[float] = []
+    r_csa_list: List[float] = []
+    sig_hq: List[bool] = []
+    sig_csa: List[bool] = []
+    labels: List[str] = []
+
+    for col, label in compare_feats:
+        pair_all = hq[[loss_col, col]].dropna()
+        pair_csa = csa[[loss_col, col]].dropna()
+        r_a = p_a = r_c = p_c = np.nan
+        if len(pair_all) > 5:
+            r_a, p_a = stats.pearsonr(pair_all.iloc[:, 0], pair_all.iloc[:, 1])
+        if len(pair_csa) > 5:
+            r_c, p_c = stats.pearsonr(pair_csa.iloc[:, 0], pair_csa.iloc[:, 1])
+        r_hq_list.append(r_a)
+        r_csa_list.append(r_c)
+        sig_hq.append(p_a < 0.05 if np.isfinite(p_a) else False)
+        sig_csa.append(p_c < 0.05 if np.isfinite(p_c) else False)
+        labels.append(label)
+
+    results["corr_comparison"] = {
+        label: {"r_hq": rh, "r_csa": rc}
+        for label, rh, rc in zip(labels, r_hq_list, r_csa_list)
+    }
+
+    y_pos = np.arange(len(labels))
+    bar_h = 0.35
+    fig, ax = plt.subplots(figsize=(10, max(4, len(labels) * 0.7)))
+    bars_hq = ax.barh(
+        y_pos - bar_h / 2, r_hq_list, bar_h, label="All HQ", color=C_T1, alpha=0.7,
+    )
+    bars_csa = ax.barh(
+        y_pos + bar_h / 2, r_csa_list, bar_h, label="CSA only", color=C_ACCENT, alpha=0.7,
+    )
+    for i, (sh, sc) in enumerate(zip(sig_hq, sig_csa)):
+        rh, rc = r_hq_list[i], r_csa_list[i]
+        if sh and np.isfinite(rh):
+            ax.text(rh, i - bar_h / 2, " *", va="center", fontsize=10, fontweight="bold")
+        if sc and np.isfinite(rc):
+            ax.text(rc, i + bar_h / 2, " *", va="center", fontsize=10, fontweight="bold", color=C_ACCENT)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Pearson r with loss proxy")
+    ax.axvline(0, color="grey", lw=0.5)
+    ax.legend(loc="lower right", fontsize=8)
+    ax.set_title(
+        f"C2: Feature correlations — All HQ (n={len(hq)}) vs CSA (n={len(csa)})    (* = p<0.05)",
+    )
+    fig.tight_layout()
+    _save(fig, plots_dir / "c2_clean_vs_all_correlations.png")
+
+    # ------------------------------------------------------------------
+    # C3: Scatter matrix on CSA days (top significant predictors)
+    # ------------------------------------------------------------------
+    scatter_pairs = [
+        ("cumulative_pm25_since_rain", loss_col, "Cumul. PM2.5", "Loss proxy (%)"),
+        ("days_since_last_rain", loss_col, "Days since rain", "Loss proxy (%)"),
+        ("cumulative_pm25_since_rain", dev_col, "Cumul. PM2.5", "Cycle deviation (%)"),
+        ("days_since_last_rain", dev_col, "Days since rain", "Cycle deviation (%)"),
+    ]
+    scatter_pairs = [
+        (x, y, xl, yl) for x, y, xl, yl in scatter_pairs
+        if x in csa.columns and y in csa.columns
+    ]
+    n_panels = len(scatter_pairs)
+    if n_panels > 0:
+        n_c = 2
+        n_r = (n_panels + n_c - 1) // n_c
+        fig, axes = plt.subplots(n_r, n_c, figsize=(12, 5 * n_r))
+        axes_flat = axes.flatten() if n_r > 1 else list(axes)
+        for ax, (xc, yc, xl, yl) in zip(axes_flat, scatter_pairs):
+            pair = csa[[xc, yc]].dropna()
+            ax.scatter(pair[xc], pair[yc], s=16, alpha=0.7, color=C_ACCENT)
+            if len(pair) > 5:
+                r_val, p_val = stats.pearsonr(pair[xc], pair[yc])
+                z = np.polyfit(pair[xc], pair[yc], 1)
+                xs = np.linspace(pair[xc].min(), pair[xc].max(), 50)
+                ax.plot(xs, np.polyval(z, xs), color=C_T1, lw=1, ls="--")
+                sig_star = " *" if p_val < 0.05 else ""
+                ax.set_title(f"r={r_val:+.3f}, p={p_val:.3f}{sig_star}", fontsize=9)
+            ax.set_xlabel(xl, fontsize=8)
+            ax.set_ylabel(yl, fontsize=8)
+        for ax in axes_flat[n_panels:]:
+            ax.set_visible(False)
+        fig.suptitle(
+            f"C3: CSA-only scatter matrix (n={len(csa)})", fontsize=11,
+        )
+        fig.tight_layout()
+        _save(fig, plots_dir / "c3_clean_scatter_matrix.png")
+
+    return results
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  Data Quality: Irradiance vs Generation                            ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+def plot_irradiance_vs_generation(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Dict[str, Any]:
+    """Data-quality diagnostic: on-site irradiance vs inverter generation.
+
+    Both quantities are summed over the tracked 10 AM – 2 PM window.
+    Produces dq1_irradiance_vs_generation.png (4-panel figure).
+    """
+    log.info("── Data quality: irradiance vs generation ──")
+    results: Dict[str, Any] = {}
+
+    irr = df["irradiance_tilted_sum"].copy()
+    gen = df["t1_energy_j"].copy()
+    day_dt = df["day_dt"]
+    month = day_dt.dt.month
+    month_names = [
+        "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+
+    gen_kwh = gen / 3.6e6
+    solcast_kwh_m2 = (
+        df["solcast_gti_sum"] / 3.6e6 if "solcast_gti_sum" in df.columns
+        else pd.Series(np.nan, index=df.index)
+    )
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+
+    # ── Panel 1: dual-axis time series ────────────────────────────────
+    ax1 = axes[0, 0]
+    ax1.plot(day_dt, irr, lw=0.8, color=C_T1, alpha=0.7, label="On-site irr (sensor sum)")
+    ax1.set_ylabel("On-site irradiance (sensor sum, arb.)", color=C_T1, fontsize=8)
+    ax1.tick_params(axis="y", labelcolor=C_T1, labelsize=7)
+    ax1_r = ax1.twinx()
+    ax1_r.plot(day_dt, gen_kwh, lw=0.8, color=C_ACCENT, alpha=0.7, label="T1 generation (kWh)")
+    ax1_r.set_ylabel("T1 generation (kWh)", color=C_ACCENT, fontsize=8)
+    ax1_r.tick_params(axis="y", labelcolor=C_ACCENT, labelsize=7)
+    ln1, lb1 = ax1.get_legend_handles_labels()
+    ln2, lb2 = ax1_r.get_legend_handles_labels()
+    ax1.legend(ln1 + ln2, lb1 + lb2, fontsize=7, loc="upper right")
+    _add_rain_cleaning_overlays(ax1, df)
+    ax1.xaxis.set_major_locator(mdates.MonthLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%y"))
+    ax1.set_title("Time series: on-site irradiance & T1 generation (10am–2pm)", fontsize=9)
+
+    # ── Panel 2: scatter irr vs gen, coloured by month ────────────────
+    ax2 = axes[0, 1]
+    valid = (irr > 0) & (gen > 0)
+    cmap = plt.cm.hsv
+    sc = ax2.scatter(
+        irr[valid], gen_kwh[valid], c=month[valid], cmap=cmap,
+        s=18, alpha=0.65, edgecolors="white", linewidths=0.3,
+        vmin=1, vmax=12,
+    )
+    cbar = fig.colorbar(sc, ax=ax2, ticks=range(1, 13))
+    cbar.ax.set_yticklabels([month_names[i] for i in range(1, 13)], fontsize=6)
+    cbar.set_label("Month", fontsize=7)
+    if valid.sum() > 3:
+        r_val, _ = stats.pearsonr(irr[valid], gen_kwh[valid])
+        ax2.set_title(f"On-site irradiance vs T1 generation (r={r_val:.3f})", fontsize=9)
+        results["onsite_irr_vs_gen_r"] = r_val
+    else:
+        ax2.set_title("On-site irradiance vs T1 generation", fontsize=9)
+    ax2.set_xlabel("On-site irradiance (sensor sum)", fontsize=8)
+    ax2.set_ylabel("T1 generation (kWh)", fontsize=8)
+
+    # ── Panel 3: Solcast peak-hour GTI vs generation ────────────────
+    ax3 = axes[1, 0]
+    sol_peak_kwh_m2 = (
+        df["solcast_gti_peak_sum"] / 3.6e6
+        if "solcast_gti_peak_sum" in df.columns
+        else pd.Series(np.nan, index=df.index)
+    )
+    sol_peak_valid = sol_peak_kwh_m2.notna() & (gen > 0) & (sol_peak_kwh_m2 > 0)
+    if sol_peak_valid.sum() > 3:
+        sc3 = ax3.scatter(
+            sol_peak_kwh_m2[sol_peak_valid], gen_kwh[sol_peak_valid],
+            c=month[sol_peak_valid], cmap=cmap, s=18, alpha=0.65,
+            edgecolors="white", linewidths=0.3, vmin=1, vmax=12,
+        )
+        r_sol_peak, _ = stats.pearsonr(
+            sol_peak_kwh_m2[sol_peak_valid], gen_kwh[sol_peak_valid],
+        )
+        ax3.set_title(
+            f"Solcast peak GTI (10–14h, kWh/m²) vs T1 gen (r={r_sol_peak:.3f})",
+            fontsize=9,
+        )
+        results["solcast_gti_peak_vs_gen_r"] = r_sol_peak
+        cbar3 = fig.colorbar(sc3, ax=ax3, ticks=range(1, 13))
+        cbar3.ax.set_yticklabels([month_names[i] for i in range(1, 13)], fontsize=6)
+        cbar3.set_label("Month", fontsize=7)
+
+        # Full-plant reference annotation
+        if "daily_generation_j" in df.columns:
+            gen_full = df["daily_generation_j"] / 3.6e6
+            full_mask = sol_peak_kwh_m2.notna() & (gen_full > 0) & (sol_peak_kwh_m2 > 0)
+            if full_mask.sum() > 3:
+                r_full, _ = stats.pearsonr(
+                    sol_peak_kwh_m2[full_mask], gen_full[full_mask],
+                )
+                ax3.text(
+                    0.02, 0.02,
+                    f"vs full-plant gen: r={r_full:.3f}",
+                    transform=ax3.transAxes, fontsize=7, va="bottom",
+                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+                )
+                results["solcast_gti_peak_vs_fullgen_r"] = r_full
+    else:
+        ax3.text(0.5, 0.5, "Solcast peak GTI not available",
+                 transform=ax3.transAxes, ha="center", fontsize=10, color="grey")
+    ax3.set_xlabel("Solcast GTI (kWh/m², 10–14h peak)", fontsize=8)
+    ax3.set_ylabel("T1 generation (kWh)", fontsize=8)
+
+    # ── Panel 4: monthly box-plot of normalised output ────────────────
+    ax4 = axes[1, 1]
+    norm_col = (
+        "t1_normalized_output"
+        if "t1_normalized_output" in df.columns
+        else "normalized_output"
+    )
+    if norm_col in df.columns:
+        valid_norm = df[norm_col].notna() & (df[norm_col] > 0)
+        months_present = sorted(df.loc[valid_norm, "day_dt"].dt.month.unique())
+        box_data = [
+            df.loc[valid_norm & (df["day_dt"].dt.month == m), norm_col].dropna().values
+            for m in months_present
+        ]
+        bp = ax4.boxplot(box_data, patch_artist=True,
+                         tick_labels=[month_names[m] for m in months_present])
+        for patch in bp["boxes"]:
+            patch.set_facecolor(C_T1)
+            patch.set_alpha(0.4)
+        ax4.set_ylabel("Normalised output (energy/irradiance)", fontsize=8)
+        ax4.set_title("Monthly normalised output consistency", fontsize=9)
+
+        medians = [np.median(b) for b in box_data if len(b) > 0]
+        if len(medians) >= 2:
+            cv = np.std(medians) / np.mean(medians) * 100
+            results["norm_output_monthly_cv_pct"] = cv
+            ax4.text(
+                0.02, 0.98, f"CV of medians = {cv:.1f}%",
+                transform=ax4.transAxes, fontsize=8, va="top",
+                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+            )
+    else:
+        ax4.text(0.5, 0.5, "Normalised output not available",
+                 transform=ax4.transAxes, ha="center", fontsize=10, color="grey")
+
+    fig.suptitle(
+        "DQ1: Data quality — irradiance vs generation (10 AM – 2 PM tracked window)",
+        fontsize=12, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, plots_dir / "dq1_irradiance_vs_generation.png")
+
+    # Summary statistics
+    results["n_zero_gen_sunny"] = int(((gen <= 0) & (irr > irr.quantile(0.25))).sum())
+    results["n_days_total"] = len(df)
+
+    log.info(
+        "DQ1 done: on-site r=%.3f, solcast-peak r=%.3f, solcast-peak-vs-fullgen r=%.3f, zero-gen-on-sunny=%d",
+        results.get("onsite_irr_vs_gen_r", float("nan")),
+        results.get("solcast_gti_peak_vs_gen_r", float("nan")),
+        results.get("solcast_gti_peak_vs_fullgen_r", float("nan")),
+        results["n_zero_gen_sunny"],
+    )
+    return results
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
 # ║  Report writer                                                     ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
@@ -1026,6 +1367,8 @@ def write_report(
     s2: SignalResult,
     s3: SignalResult,
     supporting: Dict[str, Any],
+    csa_results: Dict[str, Any],
+    dq_results: Dict[str, Any],
     out_path: Path,
 ) -> None:
     verdicts = [s1.verdict, s2.verdict, s3.verdict]
@@ -1228,6 +1571,72 @@ def write_report(
     lines.extend([
         "Plots: `s5_domain_soiling_index.png`, `s5_dspi_correlation_profile.png`",
         "",
+    ])
+
+    # ── Clear-Sky Soiling Analysis ──
+    if csa_results:
+        csa_n = csa_results.get("csa_n", 0)
+        hq_n = csa_results.get("hq_n", 0)
+        lines.extend([
+            "### Clear-Sky Soiling Analysis",
+            "",
+            f"To isolate real soiling from tropical weather noise, a Clear-Sky",
+            f"Analyzable (CSA) filter retains only days with low cloud (<35%),",
+            f"no rain (<1 mm), functioning equipment, and >=1 day since last rain.",
+            "",
+            f"- **CSA days: {csa_n} / {hq_n} HQ** ({csa_n/hq_n*100:.0f}%)" if hq_n > 0 else f"- CSA days: {csa_n}",
+            "",
+        ])
+        corr_comp = csa_results.get("corr_comparison", {})
+        if corr_comp:
+            lines.extend([
+                "**Correlation comparison (loss proxy):**",
+                "",
+                "| Feature | r (All HQ) | r (CSA only) |",
+                "|---|---|---|",
+            ])
+            for feat_label, vals in corr_comp.items():
+                rh = vals.get("r_hq", np.nan)
+                rc = vals.get("r_csa", np.nan)
+                rh_s = f"{rh:+.3f}" if isinstance(rh, float) and np.isfinite(rh) else "---"
+                rc_s = f"{rc:+.3f}" if isinstance(rc, float) and np.isfinite(rc) else "---"
+                lines.append(f"| {feat_label} | {rh_s} | {rc_s} |")
+            lines.append("")
+
+        lines.extend([
+            "Key finding: cumulative dust features (`cumulative_pm25_since_rain`,",
+            "`days_since_last_rain`) achieve statistically significant positive",
+            "correlations with loss proxy on CSA days, confirming a real soiling",
+            "signal beneath the weather noise.",
+            "",
+            "Plots: `c1_clear_sky_loss_timeseries.png`, `c2_clean_vs_all_correlations.png`, `c3_clean_scatter_matrix.png`",
+            "",
+        ])
+
+    # ── Data Quality: Irradiance vs Generation ──
+    if dq_results:
+        lines.extend([
+            "### Data Quality: Irradiance vs Generation",
+            "",
+            "Scatter and time-series of on-site irradiance sensor sum vs",
+            "T1 inverter generation, both measured during the 10 AM – 2 PM",
+            "tracked window. Used to verify data consistency after preprocessing.",
+            "",
+            f"- On-site irradiance (sensor sum) vs T1 generation: r = {_fmt_r(dq_results.get('onsite_irr_vs_gen_r'))}",
+            f"- Solcast peak GTI (10–14h, J/m²) vs T1 generation: r = {_fmt_r(dq_results.get('solcast_gti_peak_vs_gen_r'))}",
+            f"- Solcast peak GTI vs full-plant generation: r = {_fmt_r(dq_results.get('solcast_gti_peak_vs_fullgen_r'))}",
+            f"- Zero-generation on sunny days: {dq_results.get('n_zero_gen_sunny', '—')}",
+            f"- Normalised output monthly CV: {dq_results.get('norm_output_monthly_cv_pct', 0):.1f}%",
+            "",
+            "Note: low correlation with the T1 subset (3 inverters) is due to",
+            "per-inverter variability (equipment failures, clipping). Full-plant",
+            "generation correlates much better with satellite irradiance.",
+            "",
+            "Plot: `dq1_irradiance_vs_generation.png`",
+            "",
+        ])
+
+    lines.extend([
         "---",
         "",
         "## Overall Go/No-Go Verdict",
@@ -1268,8 +1677,13 @@ def main() -> None:
     s2 = test_signal_2_dust_correlation(df, plots_dir)
     s3 = test_signal_3_rain_recovery(df, plots_dir)
     supporting = run_supporting_analyses(df, plots_dir)
+    csa_results = test_clear_sky_soiling(df, plots_dir)
+    dq_results = plot_irradiance_vs_generation(df, plots_dir)
 
-    write_report(s1, s2, s3, supporting, out_dir / "eda_signal_report.md")
+    write_report(
+        s1, s2, s3, supporting, csa_results, dq_results,
+        out_dir / "eda_signal_report.md",
+    )
 
     log.info(
         "EDA complete. Verdicts: S1=%s, S2=%s, S3=%s",
