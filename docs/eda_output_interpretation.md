@@ -8,6 +8,142 @@ Generated outputs live in `artifacts/eda/`. The report is
 
 ---
 
+## What This Project Is About
+
+This project monitors a large solar power plant — thousands of panels spread
+across a field in Sri Lanka. Over time, dust, pollen, bird droppings, and
+general grime settle on the panels. This is called **soiling**. Dirty panels
+produce less electricity than clean ones.
+
+The question this project tries to answer: **can we predict how fast panels get
+dirty and when they should be cleaned, using the data we already collect?**
+
+The EDA (Exploratory Data Analysis) is the first real check: before building any
+predictive models, we need evidence that soiling is even *detectable* in our
+data. If we cannot see it, there is no point building a model to predict it.
+
+---
+
+## Key Terminology
+
+These definitions cover every domain-specific term that appears in the plots
+and report. No solar engineering background is assumed.
+
+**Soiling**: The accumulation of dust, dirt, and particulates on solar panel
+surfaces. It reduces the amount of sunlight reaching the photovoltaic cells,
+which reduces electricity output. Removed naturally by rain or manually by
+cleaning crews.
+
+**Inverter**: A device that converts the DC electricity from solar panels into
+AC electricity for the grid. Each inverter serves a group of panels. This plant
+has 34 inverters total; we monitor 6 of them (3 per physical block).
+
+**Block**: The plant is split into two physical sections. Block B2 is on one
+side, Block B1 on the other.
+
+**Tier-1 / T1 (B2 block)**: The three inverters from Block B2 (B2-08, B2-13,
+B2-17). Their data is the most complete and reliable (availability 0.77-1.0).
+We use this as *training data* — the data we trust most.
+
+**Tier-2 / T2 (B1 block)**: The three inverters from Block B1 (B1-08, B1-01,
+B1-13). Their data has more gaps (availability 0.10-1.0). We use this as a
+*validation set* — if patterns we find in B2 also appear in B1, we know the
+pattern is real and plant-wide, not a fluke of one block.
+
+**Normalised output**: Daily energy produced divided by daily sunlight received.
+This removes the effect of sunny vs cloudy days. If normalised output drops on
+a sunny day, something is wrong with the panels (likely dirt).
+
+**Rolling clean baseline**: The "best" normalised output the plant achieved in
+the last 30 days (specifically the 95th percentile). This represents "what
+output should be if panels were clean." Soiling is measured relative to this.
+
+**Loss proxy (`t1_performance_loss_pct_proxy`)**: The main metric. It answers
+"how much worse is the plant performing today compared to its recent best?" It
+is a percentage from 0 to ~80. A value of 0% means "performing as well as
+expected." A value of 30% means "producing 30% less energy than it should." It
+goes up as panels get dirty and drops when they get cleaned.
+
+**Performance Ratio (PR)**: Similar to normalised output but scaled by the
+panel's rated capacity. Our PR values are inflated (~240 instead of the normal
+~0.8) due to a known unit mismatch in the ground irradiance sensor — the
+*relative trends* are still valid, just the absolute numbers are not meaningful.
+
+**Cycle**: The period between two "reset events" (either rain or a cleaning
+campaign). During a cycle, dust accumulates. At the next rain or cleaning, it
+resets. Each cycle gets a numeric ID (`cycle_id`).
+
+**Cycle deviation (`cycle_deviation_pct`)**: Within each cycle, this measures
+how far performance has fallen from the best day in that cycle. Starts near 0%
+after a reset and rises as panels get dirtier.
+
+**Dry spell**: A consecutive stretch of days with no rain. During dry spells,
+dust accumulates uninterrupted — these are the best windows for measuring the
+soiling rate.
+
+**HQ days / Training-ready days**: Days that passed the strictest data quality
+filter — `transfer_quality_tier == "high"` AND `flag_count == 0`. These are the
+246 most trustworthy days out of 361 total. All statistical tests in the EDA
+use only these days.
+
+**PM10 / PM2.5**: Particulate Matter — tiny particles floating in the air,
+measured in micrograms per cubic metre (ug/m3). PM10 is coarser dust (diameter
+< 10 micrometres), PM2.5 is finer (< 2.5 um). These are what settle on panels
+and cause soiling.
+
+**Solcast**: A commercial satellite weather data provider. We get PM levels,
+rainfall, temperature, humidity, wind, and cloud data from them. This data is
+independent of our ground sensors at the plant.
+
+**pvlib**: An open-source Python library for solar energy modelling. It has
+physics-based models that estimate how dirty panels should be based on rainfall,
+dust levels, and panel tilt angle. We use it as an independent reference to
+compare against our data-driven loss proxy.
+
+**Wilcoxon signed-rank test**: A statistical test that checks whether paired
+measurements differ systematically (e.g., is loss at the end of a dry spell
+consistently higher than at the start?). A p-value below 0.05 means the
+difference is statistically significant (unlikely to be random chance).
+
+**Partial correlation**: The correlation between two variables after
+mathematically removing the influence of one or more confounding variables. For
+example, the partial correlation between PM10 and loss rate *controlling for
+cloud opacity* tells us whether dust predicts soiling after stripping out the
+weather effect.
+
+**Confound / Confounder**: A third variable that distorts the apparent
+relationship between two other variables. In this project, cloud opacity is the
+main confounder: cloudy days simultaneously reduce PM (less dust in humid
+air) and inflate the loss proxy (normalised output looks worse against the
+clear-sky baseline). Naive analyses that ignore this confound will produce
+misleading results.
+
+---
+
+## The Three Go/No-Go Signals
+
+The entire EDA is organised around three questions. If we can answer "yes" to
+at least two, the research is worth continuing to the modeling phase.
+
+**Signal 1 — "Can we see the sawtooth?"**
+When panels get dirty gradually and then get cleaned suddenly (by rain), a
+time-series of performance loss should look like a sawtooth wave — slowly
+rising, then sharply dropping, repeatedly. This shape is *unique* to soiling.
+Equipment failures, temperature changes, and sensor noise do not produce it.
+
+**Signal 2 — "Does dustier air mean faster soiling?"**
+If PM10 (dust in the air) is high, panels should get dirty faster. If we can
+show a statistical link between dust levels and the rate of performance decline,
+that means environmental data can *predict* soiling — which is the foundation
+for building a forecasting model.
+
+**Signal 3 — "Does rain clean the panels?"**
+After heavy rain, the loss proxy should drop (panels got washed, performance
+recovered). If rain visibly resets soiling, it confirms that what we are
+measuring really is dirt, not some other issue like equipment degradation.
+
+---
+
 ## Signal 1: Sawtooth Detection
 
 The sawtooth is the fingerprint of soiling: gradual performance decline as dust
@@ -360,14 +496,21 @@ months, teal boxes are wet months.
 `artifacts/eda/eda_signal_report.md` is structured as:
 
 1. **Data Summary**: Row counts, date range, training-ready day count.
-2. **Signal 1-3**: Each has a verdict (PASS/WEAK/FAIL), a prose summary, and
-   key quantitative metrics. Refer to the corresponding plots for visual
-   confirmation.
-3. **Supporting Findings**: pvlib comparison, sensor dirt trend, tier
+2. **Signal 1 section**: Verdict (PASS/WEAK/FAIL), the measured soiling rate
+   in %/day, how many dry spells were analysed, and what fraction had positive
+   (soiling) slopes.
+3. **Signal 2 section**: Raw correlations (with a caveat that they are
+   confounded by weather), partial correlations after deconfounding (the real
+   test), and within-cycle correlations.
+4. **Signal 3 section**: Wilcoxon p-values for the event study and the
+   dry-spell accumulation test, recovery-vs-precipitation correlation, and
+   event counts.
+5. **Supporting Findings**: pvlib comparison, sensor dirt trend, tier
    agreement, and seasonal patterns.
-4. **Overall Go/No-Go Verdict**: Aggregates the three signal verdicts.
+6. **Overall Go/No-Go Verdict**: A summary table of all three signal verdicts
+   and a recommendation.
 
-The verdict thresholds:
+### Verdict Thresholds
 
 | Signal 1 | Criteria for PASS |
 |---|---|
@@ -383,3 +526,32 @@ The verdict thresholds:
 |---|---|
 | Event study | Wilcoxon p < 0.05 for loss decrease at day +2..+5 |
 | OR dry-spell test | Wilcoxon p < 0.05 for end > start accumulation |
+
+### Overall Verdict Logic
+
+| Signals passing | Verdict | Meaning |
+|---|---|---|
+| 3/3 | **Strong go** | All signals confirmed. Proceed to modeling. |
+| 2/3 | **Conditional go** | Two signals confirmed. Proceed with caution; note the weak signal. |
+| 1/3 or 2+ weak | **Weak go** | Consider additional data sources or features before heavy modeling. |
+| 0/3 | **No-go** | Loss proxy may be dominated by equipment/data issues. Re-evaluate. |
+
+### Interpreting the Current Result
+
+The current EDA produced a **CONDITIONAL GO** verdict: Signals 1 and 2 passed,
+Signal 3 failed.
+
+**Why Signal 3 failed**: It is not because rain does not clean the panels — it
+almost certainly does. The failure is because the metric we are measuring (the
+loss proxy) is contaminated by post-rain cloudiness. Rain days and the days
+immediately following are typically cloudy. Cloudy days depress normalised
+output against the clear-sky baseline, making it look like performance got
+*worse* after rain, even though the panels are actually cleaner. The recovery
+signal is real but buried under weather noise.
+
+**What this means for next steps**: The modeling phase should be able to
+separate weather effects from soiling effects. ML models that take cloud
+opacity, temperature, and irradiance as inputs can learn to "see through" the
+weather contamination that the simple statistical tests in the EDA could not
+resolve. The fact that Signals 1 and 2 are strong provides sufficient
+confidence that soiling signal exists in the data.
