@@ -176,9 +176,24 @@ def test_signal_1_sawtooth(
         lw=0.8, color=C_T1, alpha=0.8, label="T1 loss proxy",
     )
     _add_rain_cleaning_overlays(ax1, df)
-    ax1.set_ylabel("Performance loss proxy (%)")
-    ax1.set_title("Signal 1-A: Loss proxy time-series with rain & cleaning overlays")
-    ax1.legend(loc="upper left", fontsize=8)
+    ax1.set_ylabel("Performance loss proxy (%)", color=C_T1)
+    ax1.tick_params(axis="y", labelcolor=C_T1)
+
+    if "domain_soiling_index" in df.columns:
+        ax1_twin = ax1.twinx()
+        ax1_twin.plot(
+            df["day_dt"], df["domain_soiling_index"],
+            lw=0.7, color=C_DRY, alpha=0.55, label="Domain soiling index",
+        )
+        ax1_twin.set_ylabel("Domain soiling index (cumul.)", color=C_DRY)
+        ax1_twin.tick_params(axis="y", labelcolor=C_DRY)
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1_twin.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+    else:
+        ax1.legend(loc="upper left", fontsize=8)
+
+    ax1.set_title("Signal 1-A: Loss proxy & domain soiling index with rain/cleaning overlays")
 
     ax2.bar(
         df["day_dt"], df["precipitation_total_mm"],
@@ -718,12 +733,20 @@ def run_supporting_analyses(
     results: Dict[str, Any] = {}
 
     # S4-A  univariate distributions ----------------------------------------
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    for ax, col, title, colour in [
-        (axes[0], "t1_performance_loss_pct_proxy", "Loss proxy (%)", C_T1),
-        (axes[1], "precipitation_total_mm", "Precipitation (mm)", C_RAIN),
-        (axes[2], "pm10_mean", "PM10 (µg/m³)", C_DRY),
-    ]:
+    dist_items = [
+        ("t1_performance_loss_pct_proxy", "Loss proxy (%)", C_T1),
+        ("precipitation_total_mm", "Precipitation (mm)", C_RAIN),
+        ("pm10_mean", "PM10 (µg/m³)", C_DRY),
+        ("cycle_deviation_pct", "Cycle deviation (%)", C_ACCENT),
+        ("domain_soiling_daily", "DSPI daily rate", C_DRY),
+        ("t1_perf_loss_rate_14d_pct_per_day", "Loss rate (%/day)", C_T1),
+    ]
+    dist_items = [(c, t, clr) for c, t, clr in dist_items if c in hq.columns]
+    n_cols = 3
+    n_rows = (len(dist_items) + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 4 * n_rows))
+    axes_flat = axes.flatten() if n_rows > 1 else list(axes)
+    for ax, (col, title, colour) in zip(axes_flat, dist_items):
         vals = hq[col].dropna()
         ax.hist(vals, bins=40, color=colour, alpha=0.7, edgecolor="white", lw=0.4)
         ax.set_title(title, fontsize=9)
@@ -734,35 +757,73 @@ def run_supporting_analyses(
             transform=ax.transAxes, fontsize=7, va="top", ha="right",
             bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
         )
+    for ax in axes_flat[len(dist_items):]:
+        ax.set_visible(False)
     fig.suptitle("S4-A: Univariate distributions (HQ days)", fontsize=11)
     fig.tight_layout()
     _save(fig, plots_dir / "s4_univariate_distributions.png")
 
-    # S4-B  pvlib vs observed -----------------------------------------------
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    # S4-B  pvlib & DSPI vs observed -----------------------------------------
+    has_dspi = "domain_soiling_index" in hq.columns
+    n_phys_rows = 2 if has_dspi else 1
+    fig, axes = plt.subplots(n_phys_rows, 2, figsize=(13, 5 * n_phys_rows))
+    if n_phys_rows == 1:
+        axes = axes[np.newaxis, :]
+
     pvlib_loss = hq["pvlib_soiling_loss_kimber"] * 100
     obs_loss = hq["t1_performance_loss_pct_proxy"]
+
+    # Row 1: pvlib Kimber
     pair = pd.DataFrame({"pvlib": pvlib_loss, "obs": obs_loss}).dropna()
-    ax1.scatter(pair["pvlib"], pair["obs"], s=10, alpha=0.4, color=C_ACCENT)
+    r_pv = np.nan
+    axes[0, 0].scatter(pair["pvlib"], pair["obs"], s=10, alpha=0.4, color=C_ACCENT)
     if len(pair) > 3:
         r_pv, _ = stats.pearsonr(pair["pvlib"], pair["obs"])
-        ax1.set_title(f"Scatter (r={r_pv:.3f})", fontsize=9)
-    ax1.set_xlabel("pvlib Kimber loss (%)")
-    ax1.set_ylabel("Observed loss proxy (%)")
+        axes[0, 0].set_title(f"pvlib Kimber scatter (r={r_pv:.3f})", fontsize=9)
+    else:
+        axes[0, 0].set_title("pvlib Kimber scatter", fontsize=9)
+    axes[0, 0].set_xlabel("pvlib Kimber loss (%)")
+    axes[0, 0].set_ylabel("Observed loss proxy (%)")
 
-    ax2.plot(hq["day_dt"], obs_loss, lw=0.7, color=C_T1, alpha=0.7, label="Observed proxy")
-    ax2_twin = ax2.twinx()
-    ax2_twin.plot(hq["day_dt"], pvlib_loss, lw=0.7, color=C_ACCENT, alpha=0.7, label="pvlib Kimber")
-    ax2.set_ylabel("Observed (%)", color=C_T1)
-    ax2_twin.set_ylabel("pvlib (%)", color=C_ACCENT)
-    ax2.set_title("Time-series comparison", fontsize=9)
-    lines1, labels1 = ax2.get_legend_handles_labels()
-    lines2, labels2 = ax2_twin.get_legend_handles_labels()
-    ax2.legend(lines1 + lines2, labels1 + labels2, fontsize=7)
-    fig.suptitle("S4-B: pvlib soiling estimate vs observed loss proxy", fontsize=11)
+    axes[0, 1].plot(hq["day_dt"], obs_loss, lw=0.7, color=C_T1, alpha=0.7, label="Observed proxy")
+    ax_pv_twin = axes[0, 1].twinx()
+    ax_pv_twin.plot(hq["day_dt"], pvlib_loss, lw=0.7, color=C_ACCENT, alpha=0.7, label="pvlib Kimber")
+    axes[0, 1].set_ylabel("Observed (%)", color=C_T1)
+    ax_pv_twin.set_ylabel("pvlib (%)", color=C_ACCENT)
+    axes[0, 1].set_title("pvlib time-series comparison", fontsize=9)
+    ln1, lb1 = axes[0, 1].get_legend_handles_labels()
+    ln2, lb2 = ax_pv_twin.get_legend_handles_labels()
+    axes[0, 1].legend(ln1 + ln2, lb1 + lb2, fontsize=7)
+
+    # Row 2: DSPI
+    r_dspi_lp = np.nan
+    if has_dspi:
+        dspi_vals = hq["domain_soiling_index"]
+        pair_d = pd.DataFrame({"dspi": dspi_vals, "obs": obs_loss}).dropna()
+        axes[1, 0].scatter(pair_d["dspi"], pair_d["obs"], s=10, alpha=0.4, color=C_DRY)
+        if len(pair_d) > 3:
+            r_dspi_lp, _ = stats.pearsonr(pair_d["dspi"], pair_d["obs"])
+            axes[1, 0].set_title(f"DSPI scatter (r={r_dspi_lp:.3f})", fontsize=9)
+        else:
+            axes[1, 0].set_title("DSPI scatter", fontsize=9)
+        axes[1, 0].set_xlabel("Domain soiling index")
+        axes[1, 0].set_ylabel("Observed loss proxy (%)")
+
+        axes[1, 1].plot(hq["day_dt"], obs_loss, lw=0.7, color=C_T1, alpha=0.7, label="Observed proxy")
+        ax_ds_twin = axes[1, 1].twinx()
+        ax_ds_twin.plot(hq["day_dt"], dspi_vals, lw=0.7, color=C_DRY, alpha=0.7, label="Domain soiling index")
+        axes[1, 1].set_ylabel("Observed (%)", color=C_T1)
+        ax_ds_twin.set_ylabel("DSPI (cumul.)", color=C_DRY)
+        axes[1, 1].set_title("DSPI time-series comparison", fontsize=9)
+        ln3, lb3 = axes[1, 1].get_legend_handles_labels()
+        ln4, lb4 = ax_ds_twin.get_legend_handles_labels()
+        axes[1, 1].legend(ln3 + ln4, lb3 + lb4, fontsize=7)
+
+    fig.suptitle("S4-B: Physics-based soiling estimates vs observed loss proxy", fontsize=11)
     fig.tight_layout()
     _save(fig, plots_dir / "s4_pvlib_vs_observed.png")
-    results["pvlib_r"] = r_pv if len(pair) > 3 else np.nan
+    results["pvlib_r"] = r_pv
+    results["dspi_vs_loss_proxy_r"] = r_dspi_lp
 
     # S4-C  sensor dirt check -----------------------------------------------
     fig, ax = plt.subplots(figsize=(12, 4))
@@ -1112,10 +1173,13 @@ def write_report(
         "",
         "## Supporting Findings",
         "",
-        "### pvlib Comparison",
-        f"- Kimber loss vs observed proxy correlation: r = {_fmt_r(supporting.get('pvlib_r'))}",
+        "### Physics-based Soiling Estimates vs Observed",
+        f"- pvlib Kimber vs observed loss proxy: r = {_fmt_r(supporting.get('pvlib_r'))}",
+        f"- Domain Soiling Index vs observed loss proxy: r = {_fmt_r(supporting.get('dspi_vs_loss_proxy_r'))}",
         "- pvlib predicts small losses (~1%) while the all-cause proxy fluctuates over",
-        "  a much wider range, so weak correlation is expected.",
+        "  a much wider range, so weak pvlib correlation is expected. The DSPI is tuned",
+        "  for this site and uses cumulative environmental pressure rather than",
+        "  a generic deposition model.",
         "",
         "### Sensor Dirt Check",
         f"- Solcast/ground ratio trend: {supporting.get('sensor_ratio_trend_per_day', float('nan')):.4f} per day",
