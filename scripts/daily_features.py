@@ -25,6 +25,10 @@ EXPECTED_IRR_RECORDS_PER_DAY = 96    # 24h * 4
 # clean baseline.  50 000 W·s/m² ≈ ~14 W/m² average over 1 hour.
 MIN_IRRADIANCE_FOR_BASELINE = 50_000.0
 
+# Minimum peak-hour Solcast GTI sum (J/m²) for baseline qualification.
+# 1 MJ/m² ≈ 69 W/m² average over 4 h  → excludes only heavily overcast days.
+MIN_SOLCAST_GTI_PEAK_FOR_BASELINE = 1_000_000.0
+
 # Sanity cap for normalized_output (energy_J / irradiance_sum).  Values above
 # this are clipped to prevent single-day spikes from corrupting the baseline.
 MAX_NORMALIZED_OUTPUT = 500_000.0
@@ -56,6 +60,12 @@ CLEANING_CAMPAIGN_DATES = [
 ]
 
 SIGNIFICANT_RAIN_MM = 5.0  # Precipitation threshold for "significant rain" [mm]
+
+# Clear-Sky Analyzable (CSA) thresholds
+CLOUD_OPACITY_BASELINE_MAX = 40.0   # Max cloud opacity for baseline-eligible days [%]
+CLOUD_OPACITY_CSA_MAX = 35.0        # Max cloud opacity for CSA filter [%]
+RAIN_CSA_MAX_MM = 1.0               # Max precipitation for CSA filter [mm]
+DAYS_SINCE_RAIN_CSA_MIN = 1         # Min days since last rain for CSA filter
 
 # Sri Lankan climate seasons for this tropical site (~8.5 deg N)
 _DRY_MONTHS = {1, 2, 3, 6, 7, 8, 9}       # Jan-Mar, Jun-Sep
@@ -310,6 +320,25 @@ def aggregate_solcast_daily(
                 irr_daily = irr.groupby("day").agg(**irr_agg).reset_index()
                 sol_daily = sol_daily.merge(irr_daily, on="day", how="outer")
 
+            # Peak-hour Solcast GTI (10am-2pm) — consistent satellite irradiance
+            # for normalisation, replacing the inconsistent on-site sensor sum.
+            if "gti_w_m2" in irr.columns:
+                _local_hour = irr["period_end"].dt.tz_convert("Asia/Kolkata").dt.hour
+                _peak = irr.loc[
+                    (_local_hour >= PEAK_HOUR_START) & (_local_hour < PEAK_HOUR_END)
+                ].copy()
+                _peak["_gti_peak_ws"] = _peak["gti_w_m2"] * SOLCAST_INTERVAL_S
+                _peak_daily = (
+                    _peak.groupby("day")
+                    .agg(
+                        solcast_gti_peak_sum=("_gti_peak_ws", "sum"),
+                        solcast_gti_peak_records=("gti_w_m2", "size"),
+                        solcast_gti_peak_mean_wm2=("gti_w_m2", "mean"),
+                    )
+                    .reset_index()
+                )
+                sol_daily = sol_daily.merge(_peak_daily, on="day", how="outer")
+
     return sol_daily
 
 
@@ -480,6 +509,7 @@ def aggregate_irradiance_daily(
     irr_daily["irradiance_coverage_ratio"] = (
         irr_daily["irradiance_records"] / expected_records
     ).clip(upper=1.0)
+
     return irr_daily
 
 
@@ -644,11 +674,24 @@ def compute_performance_features(
     if energy_col not in daily.columns or daily[energy_col].isna().all():
         return daily
 
+    # Prefer Solcast peak-hour GTI (consistent satellite irradiance in J/m²)
+    # over on-site sensor sum (inconsistent ThingsBoard SUM aggregation).
+    use_solcast = (
+        "solcast_gti_peak_sum" in daily.columns
+        and daily["solcast_gti_peak_sum"].notna().sum() > 0
+    )
+    if use_solcast:
+        irr_col = "solcast_gti_peak_sum"
+        irr_threshold = MIN_SOLCAST_GTI_PEAK_FOR_BASELINE
+    else:
+        irr_col = "irradiance_tilted_sum"
+        irr_threshold = MIN_IRRADIANCE_FOR_BASELINE
+
     # Normalized output with irradiance sanity guard
-    irradiance_valid = daily["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE
+    irradiance_valid = daily[irr_col] > irr_threshold
     daily[_col("normalized_output")] = np.where(
         irradiance_valid,
-        daily[energy_col] / daily["irradiance_tilted_sum"],
+        daily[energy_col] / daily[irr_col],
         np.nan,
     )
     daily[_col("normalized_output")] = daily[_col("normalized_output")].clip(
@@ -661,12 +704,18 @@ def compute_performance_features(
         daily[_col("normalized_output")].rolling(14, min_periods=5).median()
     )
 
-    # Rolling clean baseline: 95th percentile on clear days
-    clear_day_threshold = daily["irradiance_tilted_sum"].quantile(0.60)
+    # Rolling clean baseline: 95th percentile on clear days.
+    # Cloud-opacity guard prevents cloudy-but-high-irradiance days from
+    # inflating the baseline via diffuse-radiation artefacts.
+    clear_day_threshold = daily[irr_col].quantile(0.60)
     clear_day_mask = (
-        (daily["irradiance_tilted_sum"] >= clear_day_threshold)
-        & (daily["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE)
+        (daily[irr_col] >= clear_day_threshold)
+        & (daily[irr_col] > irr_threshold)
     )
+    if "cloud_opacity_mean" in daily.columns:
+        clear_day_mask = clear_day_mask & (
+            daily["cloud_opacity_mean"] <= CLOUD_OPACITY_BASELINE_MAX
+        )
     baseline_src = daily[_col("normalized_output")].where(clear_day_mask)
     daily[_col("rolling_clean_baseline")] = (
         baseline_src.rolling(30, min_periods=7).quantile(0.95).ffill()
@@ -796,14 +845,30 @@ def compute_quality_flags(daily: pd.DataFrame) -> pd.DataFrame:
         "t1_normalized_output_14d_median" if "t1_normalized_output_14d_median" in daily.columns
         else "normalized_output_14d_median"
     )
+    _qf_irr_col = (
+        "solcast_gti_peak_sum"
+        if "solcast_gti_peak_sum" in daily.columns
+           and daily["solcast_gti_peak_sum"].notna().sum() > 0
+        else "irradiance_tilted_sum"
+    )
+    _qf_irr_thr = (
+        MIN_SOLCAST_GTI_PEAK_FOR_BASELINE
+        if _qf_irr_col == "solcast_gti_peak_sum"
+        else MIN_IRRADIANCE_FOR_BASELINE
+    )
     if norm_14d_col in daily.columns:
-        irr_high = daily["irradiance_tilted_sum"].quantile(0.60)
+        irr_high = daily[_qf_irr_col].quantile(0.60)
         daily["flag_low_output_high_irr"] = (
-            (daily["irradiance_tilted_sum"] >= irr_high)
+            (daily[_qf_irr_col] >= irr_high)
             & (daily[norm_col] < 0.70 * daily[norm_14d_col])
         )
     else:
         daily["flag_low_output_high_irr"] = False
+
+    # Zero output on sunny days — equipment shutdown / data gap
+    daily["flag_zero_output"] = (
+        (daily[norm_col] <= 0) | daily[norm_col].isna()
+    ) & (daily[_qf_irr_col] > _qf_irr_thr)
 
     return daily
 
@@ -859,6 +924,52 @@ def compute_transfer_readiness(daily: pd.DataFrame) -> pd.DataFrame:
         ["high", "medium"]
     )
 
+    return daily
+
+
+# ---------------------------------------------------------------------------
+# Clear-Sky Analyzable filter
+# ---------------------------------------------------------------------------
+
+def flag_clear_sky_analyzable(daily: pd.DataFrame) -> pd.DataFrame:
+    """Mark days suitable for soiling analysis with minimal weather contamination.
+
+    Adds a boolean column ``is_clear_sky_analyzable``.  Thresholds are set via
+    module-level constants (``CLOUD_OPACITY_CSA_MAX``, ``RAIN_CSA_MAX_MM``,
+    ``DAYS_SINCE_RAIN_CSA_MIN``) so they can be tuned from one place.
+
+    Criteria
+    --------
+    1. ``transfer_quality_tier == "high"`` and ``flag_count == 0``
+    2. ``cloud_opacity_mean < CLOUD_OPACITY_CSA_MAX``
+    3. ``precipitation_total_mm < RAIN_CSA_MAX_MM``
+    4. ``t1_normalized_output > 0`` (equipment operating)
+    5. ``days_since_last_rain >= DAYS_SINCE_RAIN_CSA_MIN`` (no carry-over cloud)
+
+    Modifies *daily* in place and returns it.
+    """
+    norm_col = (
+        "t1_normalized_output"
+        if "t1_normalized_output" in daily.columns
+        else "normalized_output"
+    )
+
+    mask = pd.Series(True, index=daily.index)
+
+    if "transfer_quality_tier" in daily.columns:
+        mask &= daily["transfer_quality_tier"] == "high"
+    if "flag_count" in daily.columns:
+        mask &= daily["flag_count"] == 0
+    if "cloud_opacity_mean" in daily.columns:
+        mask &= daily["cloud_opacity_mean"] < CLOUD_OPACITY_CSA_MAX
+    if "precipitation_total_mm" in daily.columns:
+        mask &= daily["precipitation_total_mm"] < RAIN_CSA_MAX_MM
+    if norm_col in daily.columns:
+        mask &= daily[norm_col] > 0
+    if "days_since_last_rain" in daily.columns:
+        mask &= daily["days_since_last_rain"] >= DAYS_SINCE_RAIN_CSA_MIN
+
+    daily["is_clear_sky_analyzable"] = mask
     return daily
 
 
@@ -1270,8 +1381,10 @@ def compute_temperature_corrected_pr(daily: pd.DataFrame) -> pd.DataFrame:
     Requires ``air_temp_mean``, ``wind_speed_10m_mean``, and
     ``irradiance_tilted_sum`` columns.  Skips gracefully if unavailable.
     """
-    required = {"air_temp_mean", "wind_speed_10m_mean", "irradiance_tilted_sum"}
-    if not required.issubset(daily.columns):
+    required_env = {"air_temp_mean", "wind_speed_10m_mean"}
+    has_solcast_irr = "solcast_gti_peak_sum" in daily.columns
+    has_onsite_irr = "irradiance_tilted_sum" in daily.columns
+    if not required_env.issubset(daily.columns) or not (has_solcast_irr or has_onsite_irr):
         return daily
 
     try:
@@ -1281,10 +1394,12 @@ def compute_temperature_corrected_pr(daily: pd.DataFrame) -> pd.DataFrame:
 
     params = TEMPERATURE_MODEL_PARAMETERS["sapm"]["open_rack_glass_polymer"]
 
-    # Convert daily irradiance sum (W-s/m^2) to average POA irradiance (W/m^2)
-    # over peak hours (4 hours = 14400 seconds)
+    # Convert daily irradiance sum (J/m²) to average POA irradiance (W/m²)
+    # over peak hours (4 hours = 14400 seconds).
+    # Prefer Solcast peak-hour GTI (consistent satellite data).
     peak_seconds = (PEAK_HOUR_END - PEAK_HOUR_START) * 3600.0
-    poa_avg = daily["irradiance_tilted_sum"] / peak_seconds
+    irr_src = "solcast_gti_peak_sum" if has_solcast_irr else "irradiance_tilted_sum"
+    poa_avg = daily[irr_src] / peak_seconds
 
     cell_temp = sapm_cell(
         poa_global=poa_avg,

@@ -44,6 +44,7 @@ from daily_features import (
     compute_soiling_features,
     compute_temperature_corrected_pr,
     compute_transfer_readiness,
+    flag_clear_sky_analyzable,
     detect_irradiance_cols,
     filter_irradiance_threshold,
     filter_peak_hours,
@@ -287,7 +288,13 @@ def build_daily_model_table(
     daily = compute_domain_soiling_index(daily)
 
     # --- Cycle-aware deviation ---
-    daily = compute_cycle_deviation(daily)
+    _irr_col_for_cycle = (
+        "solcast_gti_peak_sum"
+        if "solcast_gti_peak_sum" in daily.columns
+           and daily["solcast_gti_peak_sum"].notna().sum() > 0
+        else "irradiance_tilted_sum"
+    )
+    daily = compute_cycle_deviation(daily, irr_sum_col=_irr_col_for_cycle)
 
     # --- Temperature correction ---
     daily = compute_temperature_corrected_pr(daily)
@@ -302,6 +309,9 @@ def build_daily_model_table(
 
     # --- Transfer readiness (shared logic) ---
     daily = compute_transfer_readiness(daily)
+
+    # --- Clear-Sky Analyzable flag (requires flag_count + transfer tier) ---
+    daily = flag_clear_sky_analyzable(daily)
 
     return daily
 
@@ -326,7 +336,11 @@ def write_preprocessing_summary(
     cov_gap = int(daily.get("flag_coverage_gap", pd.Series(dtype=bool)).sum())
     blk_mismatch = int(daily.get("flag_block_mismatch", pd.Series(dtype=bool)).sum())
     low_out = int(daily.get("flag_low_output_high_irr", pd.Series(dtype=bool)).sum())
+    zero_out = int(daily.get("flag_zero_output", pd.Series(dtype=bool)).sum())
     total_flagged = int((daily.get("flag_count", 0) > 0).sum())
+
+    # Clear-sky analyzable
+    csa_days = int(daily.get("is_clear_sky_analyzable", pd.Series(dtype=bool)).sum())
 
     # Performance loss distribution
     perf_loss = daily["performance_loss_pct_proxy"]
@@ -423,6 +437,10 @@ def write_preprocessing_summary(
         f"- Coverage gap days: {cov_gap}",
         f"- Block mismatch days: {blk_mismatch}",
         f"- Low output under high irradiance days: {low_out}",
+        f"- Zero output on sunny days (equipment shutdown): {zero_out}",
+        "",
+        "## Clear-Sky Analyzable (CSA)",
+        f"- CSA days (clear, dry, equipment OK): {csa_days}/{total_days}",
     ] + block_lines + filter_lines + soiling_lines + per_inv_lines + [
         "",
         "## Notes",
