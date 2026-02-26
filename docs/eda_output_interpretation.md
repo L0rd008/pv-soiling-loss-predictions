@@ -673,6 +673,89 @@ zero.
 
 ---
 
+## Clear-Sky Soiling Analysis (C-series plots)
+
+### Why this section exists
+
+The soiling metrics in this dataset are heavily contaminated by tropical
+weather. The site averages 36% cloud opacity and receives rain on over 40%
+of days. Cloud reduces normalised output against the clear-sky baseline,
+creating loss proxy spikes that are weather artefacts, not soiling. Equipment
+shutdowns (11 zero-output days) add further 100% loss spikes.
+
+The **Clear-Sky Analyzable (CSA)** filter retains only days where weather
+contamination is minimal:
+
+- Cloud opacity < 35%
+- Precipitation < 1 mm
+- Equipment operating (output > 0)
+- At least 1 day since last rain (no carry-over cloud)
+- High-quality data (HQ tier, no flags)
+
+This keeps ~57 / 235 HQ days (~24%). On these days, the real soiling signal
+emerges from under the weather noise.
+
+### c1_clear_sky_loss_timeseries.png
+
+**Layout**: Time-series with faded grey/purple line showing all HQ days, and
+green dots (connected) showing only CSA-qualified days.
+
+**What to look for**:
+
+- The grey backdrop shows the full HQ loss proxy — noisy, with many weather-
+  driven spikes.
+- The green CSA dots should trace smoother, rising trends during dry spells
+  and drop sharply at rain events — the soiling sawtooth pattern.
+- Dry-spell clusters (e.g., consecutive CSA dots at 5-13 days since rain)
+  with progressively increasing loss values confirm real soiling accumulation
+  that is masked in the full HQ series.
+- Large gaps between CSA dots indicate prolonged cloudy/rainy periods where
+  no clean-condition days were available.
+
+### c2_clean_vs_all_correlations.png
+
+**Layout**: Horizontal grouped bar chart. For each feature, two bars show
+its Pearson r with loss proxy on All HQ days (purple) vs CSA-only days
+(green). Asterisks (*) mark statistically significant correlations (p < 0.05).
+
+**What to look for**:
+
+- **Cumulative PM2.5 since rain** and **Days since rain** should show
+  markedly stronger positive correlations on CSA days than on all HQ days.
+  This confirms that the soiling signal was being diluted by weather noise.
+- **Cloud opacity** should show a weaker (less negative) correlation on CSA
+  days, confirming the filter reduced weather contamination.
+- **Raw PM10/PM2.5** will likely remain weak or slightly negative even on CSA
+  days — this is expected because daily PM concentration measures today's air
+  quality, not accumulated panel dust.
+- Features with asterisks on the CSA bar but not on the HQ bar are features
+  whose soiling signal only becomes visible when weather is controlled for.
+
+### c3_clean_scatter_matrix.png
+
+**Layout**: 2x2 scatter plot matrix showing the two strongest soiling
+predictors against two loss metrics, on CSA days only:
+
+- Top-left: `cumulative_pm25_since_rain` vs `loss_proxy`
+- Top-right: `days_since_last_rain` vs `loss_proxy`
+- Bottom-left: `cumulative_pm25_since_rain` vs `cycle_deviation_pct`
+- Bottom-right: `days_since_last_rain` vs `cycle_deviation_pct`
+
+Each panel includes a regression line, Pearson r, p-value, and significance
+marker.
+
+**What to look for**:
+
+- Positive slopes with p < 0.05 confirm statistically significant soiling
+  relationships: the longer since rain (or the more PM2.5 has accumulated),
+  the greater the performance loss.
+- Scatter around the regression line indicates how much unexplained variance
+  remains — tighter clusters mean stronger predictive power.
+- If `cycle_deviation_pct` shows stronger correlations than `loss_proxy`, it
+  suggests the within-cycle metric is a better soiling target for modeling.
+
+---
+
 ## Reading the Signal Report
 
 `artifacts/eda/eda_signal_report.md` is structured as:
@@ -688,7 +771,7 @@ zero.
    dry-spell accumulation test, recovery-vs-precipitation correlation, and
    event counts.
 5. **Supporting Findings**: pvlib comparison, sensor dirt trend, tier
-   agreement, and seasonal patterns.
+   agreement, seasonal patterns, DSPI, and clear-sky soiling analysis.
 6. **Overall Go/No-Go Verdict**: A summary table of all three signal verdicts
    and a recommendation.
 

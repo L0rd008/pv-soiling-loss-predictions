@@ -259,6 +259,48 @@ Rules:
 - Constraint: maintain exactly 4 inverters per block.
 - Action: run availability comparison on alternate IDs, then decide whether to swap.
 
+### ✅ Resolved: Tropical weather contamination of soiling metrics
+
+The site (~8.5°N, Sri Lanka) has tropical climate with high baseline cloud
+cover (mean 36% opacity on HQ days), frequent rain (>40% of days), and
+narrow temperature range (24-31°C). This creates three problems for soiling
+analysis:
+
+1. **Cloud-driven metric spikes**: Cloud opacity has r = -0.35 with the
+   performance loss proxy. Cloudy days depress normalised output against the
+   clear-sky baseline, producing false "soiling" spikes that are actually
+   weather artefacts.
+2. **Equipment failures passing quality filters**: 11 zero-output days
+   (equipment shutdowns on sunny days) survived the original HQ filter,
+   creating 100% loss proxy spikes.
+3. **Rain carry-over**: Days immediately following rain are typically cloudy,
+   masking any panel-cleaning benefit and making the rain recovery signal
+   (Signal 3) fail in statistical tests.
+
+**Mitigations applied**:
+
+- `flag_zero_output`: New quality flag catches equipment shutdowns where
+  output = 0 despite sufficient irradiance.
+- Cloud-opacity guard on baseline: The rolling 95th-percentile baseline now
+  excludes days with cloud > 40%, preventing cloudy days from inflating it.
+- Clear-Sky Analyzable (CSA) filter: A boolean column `is_clear_sky_analyzable`
+  marks 57 of 235 HQ days (24%) where cloud < 35%, rain < 1 mm, equipment OK,
+  and >= 1 day since rain. On CSA days, cumulative dust features achieve
+  statistically significant positive correlations with loss proxy
+  (cumulative PM2.5: r = +0.36, p = 0.01; days since rain: r = +0.36,
+  p = 0.01) that are hidden in the unfiltered data.
+- EDA C-series plots visualise the contrast between all-HQ and CSA analyses.
+
+**Efficiency factors quantified** (variance contribution to loss proxy):
+
+| Factor | Impact | Notes |
+|---|---|---|
+| Cloud opacity | Dominant (~r = -0.35) | Drives most non-soiling variance |
+| Equipment shutdown | 11 days at 100% loss | Now flagged |
+| Temperature | Minor (r ~ -0.10) | Narrow tropical range limits effect |
+| Rain carry-over cloud | Masks recovery signal | Causes Signal 3 failure |
+| Irradiance sensor soiling | Unknown magnitude | Cross-check via Solcast ratio |
+
 ### ⏸ Future: Integrate plant weather station telemetry
 
 - Device `f81ed490-9cd2-11ef-9b7d-ef27f6a9abbc` provides 1-minute:

@@ -6,7 +6,7 @@ signals for soiling loss prediction.
 ## Prerequisites
 
 Stages 1-4 must be complete. The input file
-`artifacts/preprocessed/daily_model_eda.csv` must exist with all 116 columns
+`artifacts/preprocessed/daily_model_eda.csv` must exist with all 118 columns
 (including per-inverter metrics, soiling features, pvlib estimates, and
 cycle-aware deviation).
 
@@ -32,7 +32,7 @@ python scripts/eda_soiling_signals.py --input path/to/daily_model_eda.csv --out-
 
 | File | Role |
 |---|---|
-| `artifacts/preprocessed/daily_model_eda.csv` | Daily feature table (361 rows, 114 columns) |
+| `artifacts/preprocessed/daily_model_eda.csv` | Daily feature table (361 rows, 118 columns) |
 
 The script also imports constants from `scripts/daily_features.py`:
 `CLEANING_CAMPAIGN_DATES`, `SIGNIFICANT_RAIN_MM`, `SITE_LAT`, `SITE_LON`.
@@ -50,12 +50,13 @@ predictable from the available data:
 3. **Signal 3 (Rain Recovery)**: Tests whether significant rainfall causes a
    measurable decrease in the loss proxy.
 
-It also runs six supporting analyses (univariate distributions, pvlib
-comparison, sensor dirt check, tier validation, seasonal patterns, quality
-gating).
+It also runs supporting analyses (univariate distributions, pvlib comparison,
+sensor dirt check, tier validation, seasonal patterns, quality gating, DSPI)
+and a **Clear-Sky Soiling Analysis** on weather-filtered days.
 
-All analyses are restricted to high-quality, zero-flag days (246 of 361) for
-statistical tests, while time-series plots show the full dataset.
+All analyses are restricted to high-quality, zero-flag days (235 of 361) for
+statistical tests. The clear-sky analysis further filters to 57 CSA days
+where weather contamination is minimal.
 
 ## Outputs
 
@@ -90,13 +91,16 @@ All saved to `artifacts/eda/plots/`:
 | `s4_quality_gating.png` | Support | Quality score distribution and tier counts |
 | `s5_domain_soiling_index.png` | DSPI | Domain Soiling Pressure Index vs cycle deviation time-series |
 | `s5_dspi_correlation_profile.png` | DSPI | DSPI correlation with environmental and performance features |
+| `c1_clear_sky_loss_timeseries.png` | CSA | Loss proxy on clear-sky days (CSA dots over faded HQ backdrop) |
+| `c2_clean_vs_all_correlations.png` | CSA | Side-by-side correlation comparison: All HQ vs CSA-filtered |
+| `c3_clean_scatter_matrix.png` | CSA | 2x2 scatter matrix of top soiling predictors on CSA days |
 
 ## Validation Checks
 
 Verify output completeness:
 
 ```powershell
-python -c "import os; plots=[f for f in os.listdir('artifacts/eda/plots') if f.endswith('.png')]; print(f'{len(plots)} plots'); assert len(plots) >= 14, 'Expected at least 14 plots'"
+python -c "import os; plots=[f for f in os.listdir('artifacts/eda/plots') if f.endswith('.png')]; print(f'{len(plots)} plots'); assert len(plots) >= 22, 'Expected at least 22 plots'"
 ```
 
 Verify the report exists and contains all signal verdicts:

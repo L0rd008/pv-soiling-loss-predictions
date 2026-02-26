@@ -142,6 +142,11 @@ Quality flags:
 - `flag_sensor_suspect_irradiance`
 - `flag_coverage_gap`
 - `flag_block_mismatch`
+- `flag_low_output_high_irr`
+- `flag_zero_output` — equipment shutdown on sunny day (output <= 0 with irradiance above baseline minimum)
+
+Clear-Sky Analyzable filter:
+- `is_clear_sky_analyzable` — boolean: day passes all CSA criteria (HQ tier, low cloud, no rain, equipment OK, 1+ day since rain). Used for weather-deconfounded soiling analysis.
 
 Cross-plant transfer fields:
 - `transfer_quality_score` (0-100)
@@ -278,7 +283,7 @@ Computed by `compute_cycle_deviation()`. Cycles are delimited by rain or cleanin
 ## EDA Outputs (`artifacts/eda/`)
 
 `scripts/eda_soiling_signals.py` produces a quantitative signal report and
-19 diagnostic plots. See `docs/eda_output_interpretation.md` for how to read
+22 diagnostic plots. See `docs/eda_output_interpretation.md` for how to read
 each output.
 
 ### Report
@@ -330,3 +335,6 @@ each output.
 |---|---|
 | `plots/s5_domain_soiling_index.png` | DSPI cumulative index vs cycle deviation time-series with rain/cleaning overlays |
 | `plots/s5_dspi_correlation_profile.png` | Horizontal bar chart of DSPI correlation with each environmental and performance feature |
+| `plots/c1_clear_sky_loss_timeseries.png` | Loss proxy on Clear-Sky Analyzable days only, with all-HQ backdrop |
+| `plots/c2_clean_vs_all_correlations.png` | Side-by-side correlation comparison: All HQ vs CSA-filtered days |
+| `plots/c3_clean_scatter_matrix.png` | 2x2 scatter matrix of top soiling predictors vs loss metrics on CSA days |
