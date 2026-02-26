@@ -6,7 +6,7 @@ signals for soiling loss prediction.
 ## Prerequisites
 
 Stages 1-4 must be complete. The input file
-`artifacts/preprocessed/daily_model_eda.csv` must exist with all 114 columns
+`artifacts/preprocessed/daily_model_eda.csv` must exist with all 116 columns
 (including per-inverter metrics, soiling features, pvlib estimates, and
 cycle-aware deviation).
 
@@ -76,7 +76,7 @@ All saved to `artifacts/eda/plots/`:
 | `s1_cycle_deviation.png` | 1 | Cycle-aware deviation time-series |
 | `s1_dryspell_slopes.png` | 1 | Linear soiling rates fitted within dry spells |
 | `s2_pm10_scatter_panels.png` | 2 | PM10 vs loss rate — raw and clear-sky |
-| `s2_cumulative_pm10_vs_deviation.png` | 2 | Cumulative dust exposure vs cycle deviation |
+| `s2_top_predictors_vs_deviation.png` | 2 | Top 3 predictors (days since rain, cumul. PM2.5, cumul. PM10) vs cycle deviation |
 | `s2_feature_heatmap.png` | 2 | Feature correlation matrix |
 | `s3_rain_event_study.png` | 3 | Loss trajectory around significant rain events |
 | `s3_dryspell_start_end.png` | 3 | Paired comparison: dry-spell start vs end loss |
@@ -88,6 +88,8 @@ All saved to `artifacts/eda/plots/`:
 | `s4_tier_validation.png` | Support | T1 vs T2 loss proxy overlay |
 | `s4_seasonal_boxplots.png` | Support | Monthly loss distribution box plots |
 | `s4_quality_gating.png` | Support | Quality score distribution and tier counts |
+| `s5_domain_soiling_index.png` | DSPI | Domain Soiling Pressure Index vs cycle deviation time-series |
+| `s5_dspi_correlation_profile.png` | DSPI | DSPI correlation with environmental and performance features |
 
 ## Validation Checks
 

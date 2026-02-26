@@ -234,6 +234,49 @@ Tests whether airborne particulate matter (PM10, PM2.5) predicts how fast
 panels soil. If PM does not predict soiling rate, the ML model cannot forecast
 soiling from environmental data alone.
 
+### How Signal 2 correlations work
+
+Every correlation in this section has two sides:
+
+- **Side A — Environmental inputs** (independent variables): PM10, PM2.5,
+  rainfall, humidity, wind, cumulative dust since rain, days since rain, etc.
+  These come from Solcast satellite data and are available without any solar
+  plant — they describe what the atmosphere is doing.
+- **Side B — Observed plant performance** (dependent variables): metrics
+  derived from the plant's actual energy generation that measure how well the
+  panels are converting sunlight into electricity.
+
+The go/no-go question is: **do environmental factors predict what actually
+happens to the plant?** This requires crossing data domains — environment on
+one side, real performance on the other. Correlating one environmental feature
+against another environmental feature would be circular and prove nothing about
+whether soiling affects the plant.
+
+**The three performance targets (Side B):**
+
+| Target | What it measures | Derived from |
+|---|---|---|
+| `t1_performance_loss_pct_proxy` | All-cause daily performance deficit vs the rolling 30-day clean baseline | Actual Tier-1 energy generation and irradiance |
+| `t1_perf_loss_rate_14d_pct_per_day` | How fast loss is changing (14-day slope of the proxy) | 14-day rolling regression on the loss proxy above |
+| `cycle_deviation_pct` | Within-cycle performance decline from the cycle's best day | Actual energy generation normalised by irradiance, reset at each rain/cleaning event |
+
+**Which target matters most for go/no-go?** `cycle_deviation_pct` is the
+cleanest soiling signal. Because it resets at every rain or cleaning event, it
+measures only within-cycle decline and removes long-term baseline drift and
+seasonal effects. The `vs cycle deviation` column in the partial correlation
+table is the most informative for the go/no-go decision.
+
+The loss proxy is noisier because it includes weather effects (cloudy days look
+like worse performance even though the panels are not dirtier). The loss rate
+captures trends but is smoothed over 14 days, blurring short-cycle signals.
+
+**Why not use an environmental soiling estimate as the target?** A feature
+built purely from environmental data (e.g., cumulative PM weighted by humidity)
+would correlate with PM10 and rainfall by construction — you put those inputs
+in, so getting correlations back out proves nothing. The test must cross from
+*environment* to *observed performance* to demonstrate that soiling is real and
+detectable in the plant's energy output.
+
 **Critical context**: The raw PM10 correlation with loss proxy is **negative**
 (r = -0.248) — counterintuitive. This is because dry, clear weather brings both
 high PM and good system performance simultaneously. Cloud opacity (r = -0.405)
@@ -258,21 +301,25 @@ weather effects to find the real PM-soiling relationship.
   negative to positive, that is evidence of successful deconfounding.
 - The right panel has fewer points (~90 clear days) so expect more scatter.
 
-### s2_cumulative_pm10_vs_deviation.png
+### s2_top_predictors_vs_deviation.png
 
-**Layout**: Single scatter. `cumulative_pm10_since_rain` (x-axis) vs
-`cycle_deviation_pct` (y-axis) on HQ days, with a fitted regression line.
+**Layout**: Three side-by-side scatter panels showing the strongest predictors
+of cycle deviation. Left: `days_since_last_rain`, middle:
+`cumulative_pm25_since_rain`, right: `cumulative_pm10_since_rain`. Each has
+its own Pearson r, p-value, and regression line.
 
 **What to look for**:
 
-- A positive correlation (upward trend) means accumulated dust since the last
-  rain predicts within-cycle performance decline — the most direct
-  dust-to-soiling signal.
-- The annotation gives Pearson r and p-value. r > 0.15 with p < 0.05 is a
-  meaningful signal.
-- Points clustering near origin are from recently-rained days (reset to zero
-  dust, near-zero deviation). The relationship shows as you move right (more
-  accumulated dust).
+- Positive correlations (upward trends) in all three panels confirm that time
+  since rain and accumulated dust predict within-cycle performance decline.
+- Compare the r values across panels: the strongest predictor has the steepest
+  regression line and highest r. `days_since_last_rain` and
+  `cumulative_pm25_since_rain` are typically the strongest, reflecting that
+  soiling accumulates over dry days and that finer PM2.5 particles adhere to
+  panels more than coarser PM10 (consistent with the soiling literature).
+- Points clustering near the origin are from recently-rained days (zero dust
+  accumulation, near-zero deviation). The relationship emerges as you move
+  right (longer dry stretches, more accumulated dust).
 
 ### s2_feature_heatmap.png
 
@@ -289,9 +336,11 @@ Colour scale: blue = negative, red = positive; values annotated in each cell.
   into ML models.
 - `cloud_opacity_mean` correlating strongly with loss proxy confirms it as
   the primary confounder.
-- `cycle_deviation_pct` having strong correlations with `days_since_last_rain`
-  and `cumulative_pm10_since_rain` confirms these engineered features capture
-  soiling dynamics.
+- `cycle_deviation_pct` having strong correlations with `days_since_last_rain`,
+  `cumulative_pm25_since_rain`, and `cumulative_pm10_since_rain` confirms these
+  engineered features capture soiling dynamics. PM2.5 accumulation typically
+  shows a stronger correlation than PM10, consistent with finer particles
+  adhering more to panel surfaces.
 
 ### Partial Correlation Table (in report)
 
@@ -488,6 +537,106 @@ months, teal boxes are wet months.
 - If the "high" bar is much smaller than total days, many days have quality
   issues and the pipeline may need stricter cleaning or additional data
   sources.
+
+---
+
+## Domain Soiling Pressure Index (DSPI)
+
+The DSPI is a physics-based daily soiling estimate built entirely from
+environmental satellite data (PM2.5, PM10, humidity, dewpoint,
+precipitation). **No plant performance data is used**, so there is no
+data-leakage concern. It represents what the soiling literature says
+*should* be happening to panels given the environmental conditions.
+
+**Formula**:
+
+    daily_rate = (w_pm25 * PM2.5 + w_pm10 * PM10)
+                 * humidity_factor * dew_factor * cementation_factor
+
+- **Base deposition**: PM2.5 is weighted higher than PM10 because finer
+  particles fill interparticle gaps more completely and resist wind/rain
+  removal (Appels et al.; confirmed by our data where cumulative PM2.5
+  outperforms cumulative PM10 in predicting cycle deviation).
+- **Humidity adhesion factor**: adhesion increases with relative humidity
+  due to capillary bridges between particles and glass (Said et al.: ~80%
+  adhesion increase from 40% to 80% RH). Factor ranges 1.0 to 2.0.
+- **Dew proximity factor**: when the air-dewpoint temperature spread is
+  small (< 10 C), dew forms on panel surfaces, promoting dust coagulation
+  and cementation. Factor ranges 1.0 to 1.5.
+- **Light-rain cementation**: rainfall below 1 mm/day wets dust without
+  washing it away, increasing adhesion (Mejia et al.). Rain >= 1 mm triggers
+  a cleaning reset.
+- **Cumulative index**: the daily rate accumulates over time and resets to
+  zero on cleaning rain (>= 1 mm) or known cleaning campaigns.
+
+**Weight calibration**: the five scale parameters (PM2.5 weight, PM10 weight,
+humidity scale, dew scale, cementation boost) are calibrated via constrained
+optimisation. The objective maximises positive correlation with PM10/PM2.5 and
+negative correlation with precipitation, while penalising correlation with
+non-soiling factors (cloud opacity, temperature). Domain-knowledge bounds
+enforce physically meaningful ranges. No plant performance metrics are used
+in the optimisation.
+
+**Important caveats**:
+
+- The DSPI is **not** ground truth for soiling. It is a theoretical estimate
+  that correlates with environmental soiling drivers by construction.
+- **Tropical humidity paradox**: at this site (8.5 N latitude), humidity is
+  always high (78-98%). Between-day humidity variation is dominated by rain
+  proximity, not by the micro-physics adhesion effect described in the
+  literature. This means the humidity factor adds some noise at daily
+  resolution despite being physically correct at the particle level.
+- The DSPI should be used as: (a) a visualization tool showing expected
+  soiling accumulation patterns, (b) a modeling feature carrying domain
+  physics into ML, (c) a qualitative reference for comparison against
+  observed performance metrics. It should NOT be used as a correlation
+  target (correlating environmental features against it would be circular).
+
+### s5_domain_soiling_index.png
+
+**Layout**: Single time-series with dual y-axes.
+
+- Left y-axis (amber): `domain_soiling_index` — the cumulative DSPI.
+- Right y-axis (purple): `cycle_deviation_pct` — the observed within-cycle
+  performance deviation (from actual plant energy generation).
+- Faint blue vertical lines mark significant rain events (>= 5 mm).
+- Shaded orange bands mark cleaning campaigns.
+
+**What to look for**:
+
+- Both traces should show sawtooth-like patterns: gradual accumulation during
+  dry periods and sharp drops at rain/cleaning events.
+- When the amber line (physics estimate) and the purple line (observed
+  performance decline) rise and fall at the same times, that confirms the
+  DSPI captures real soiling dynamics.
+- Periods where the DSPI rises but cycle deviation does not may indicate
+  other factors (e.g., cloud contamination in the performance metric) masking
+  the soiling signal.
+- The magnitude scales will differ because the DSPI is in arbitrary
+  composite units while cycle deviation is in percentage points.
+
+### s5_dspi_correlation_profile.png
+
+**Layout**: Horizontal bar chart. Each bar shows the Pearson r between
+`domain_soiling_index` and one environmental or performance feature on HQ
+days. Green bars = positive correlation, red bars = negative, grey = near
+zero.
+
+**What to look for**:
+
+- **Expected positive correlations**: PM2.5, PM10, cumulative PM features,
+  days since rain, humidity x PM10. These indicate the DSPI correctly
+  represents soiling pressure from dust exposure.
+- **Expected negative correlations**: precipitation (rain cleans), humidity
+  (the tropical paradox — see caveat above).
+- **Near-zero expected**: cloud opacity, air temperature. These should be
+  close to zero if the optimisation successfully decoupled the DSPI from
+  non-soiling weather variation. Values > 0.15 in absolute terms suggest
+  residual weather contamination.
+- **Performance feature correlations**: positive correlation with loss proxy,
+  loss rate, and especially cycle deviation would mean the physics-based
+  estimate aligns with what is actually observed at the plant — the strongest
+  possible validation that the DSPI captures real soiling.
 
 ---
 

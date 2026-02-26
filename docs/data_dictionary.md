@@ -224,6 +224,19 @@ Computed by `compute_soiling_features()`. Require Solcast columns to be present.
 | `month` | int | 1-12 | Calendar month |
 | `season` | string | category | `dry` (Jan-Mar, Jun-Sep) or `wet` (Apr-May, Oct-Dec) |
 
+## Domain Soiling Pressure Index (in `daily_model_input.csv`)
+
+Computed by `compute_domain_soiling_index()`. A physics-based soiling estimate
+built entirely from environmental satellite data. No plant performance data is
+used. Weights are calibrated via constrained optimisation that maximises
+positive correlation with PM and negative with rainfall while penalising
+correlation with non-soiling factors.
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `domain_soiling_daily` | float64 | composite | Daily soiling pressure rate: `(w_pm25*PM2.5 + w_pm10*PM10) * humidity_factor * dew_factor * cementation_factor` |
+| `domain_soiling_index` | float64 | composite (cumul.) | Cumulative sum of `domain_soiling_daily`, resets on rain >= 1 mm or cleaning campaigns |
+
 ## pvlib Soiling Estimates (in `daily_model_input.csv`)
 
 Computed by `compute_pvlib_soiling_ratio()` from 10-min Solcast data.
@@ -265,7 +278,7 @@ Computed by `compute_cycle_deviation()`. Cycles are delimited by rain or cleanin
 ## EDA Outputs (`artifacts/eda/`)
 
 `scripts/eda_soiling_signals.py` produces a quantitative signal report and
-17 diagnostic plots. See `docs/eda_output_interpretation.md` for how to read
+19 diagnostic plots. See `docs/eda_output_interpretation.md` for how to read
 each output.
 
 ### Report
@@ -288,7 +301,7 @@ each output.
 | File | Description |
 |---|---|
 | `plots/s2_pm10_scatter_panels.png` | PM10 vs loss rate, raw and clear-sky deconfounded |
-| `plots/s2_cumulative_pm10_vs_deviation.png` | Cumulative dust exposure vs cycle deviation |
+| `plots/s2_top_predictors_vs_deviation.png` | Top 3 predictors (days since rain, cumul. PM2.5, cumul. PM10) vs cycle deviation |
 | `plots/s2_feature_heatmap.png` | Feature correlation matrix (environmental, engineered, targets) |
 
 ### Signal 3 Plots (Rain Recovery)
@@ -310,3 +323,10 @@ each output.
 | `plots/s4_tier_validation.png` | T1 vs T2 loss proxy overlay |
 | `plots/s4_seasonal_boxplots.png` | Monthly loss distribution box plots |
 | `plots/s4_quality_gating.png` | Quality score distribution and tier counts |
+
+### Domain Soiling Pressure Index Plots
+
+| File | Description |
+|---|---|
+| `plots/s5_domain_soiling_index.png` | DSPI cumulative index vs cycle deviation time-series with rain/cleaning overlays |
+| `plots/s5_dspi_correlation_profile.png` | Horizontal bar chart of DSPI correlation with each environmental and performance feature |
