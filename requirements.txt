@@ -3,3 +3,6 @@ pandas>=2.2
 matplotlib>=3.8
 requests>=2.32
 python-dotenv>=1.0
+pvlib>=0.12
+scikit-learn>=1.5
+scipy>=1.12

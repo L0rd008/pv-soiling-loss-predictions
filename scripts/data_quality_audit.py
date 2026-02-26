@@ -15,13 +15,22 @@ from daily_features import (
     INVERTER_INTERVAL_S,
     EXPECTED_INV_RECORDS_PER_DAY,
     EXPECTED_IRR_RECORDS_PER_DAY,
+    PEAK_INV_RECORDS_PER_DAY,
+    PEAK_IRR_RECORDS_PER_DAY,
+    PEAK_HOUR_START,
+    PEAK_HOUR_END,
     detect_block_power_cols as block_power_columns,
+    detect_irradiance_cols,
     aggregate_solcast_daily,
     aggregate_tier_daily,
     compute_common_overlap,
     compute_cross_block_correlation,
+    compute_cycle_deviation,
     compute_performance_features,
     compute_quality_flags as _shared_quality_flags,
+    compute_soiling_features,
+    filter_irradiance_threshold,
+    filter_peak_hours,
 )
 
 
@@ -164,10 +173,18 @@ def build_daily_features(
     irradiance: pd.DataFrame,
     generation: pd.DataFrame,
     solcast_daily: pd.DataFrame = None,
+    apply_peak_filter: bool = True,
 ) -> pd.DataFrame:
     inv = inverters.copy()
     irr = irradiance.copy()
     gen = generation.copy()
+
+    # --- Peak-hour and irradiance-threshold filtering (same as preprocessing) ---
+    if apply_peak_filter:
+        inv, inv_removed = filter_peak_hours(inv)
+        irr, irr_removed = filter_peak_hours(irr)
+        tilted_col, _ = detect_irradiance_cols(irr.columns)
+        irr, irr_thr_removed, _ = filter_irradiance_threshold(irr, tilted_col)
 
     inv["day"] = inv["Date"].dt.date
     irr["day"] = irr["Date"].dt.date
@@ -191,8 +208,9 @@ def build_daily_features(
         phase_imbalance_p95=("phase_imbalance", lambda s: s.quantile(0.95)),
         inverter_records=("Timestamp", "size"),
     )
+    exp_inv = PEAK_INV_RECORDS_PER_DAY if apply_peak_filter else EXPECTED_INV_RECORDS_PER_DAY
     inv_daily["inverter_coverage_ratio"] = (
-        inv_daily["inverter_records"] / EXPECTED_INV_RECORDS_PER_DAY
+        inv_daily["inverter_records"] / exp_inv
     ).clip(upper=1.0)
 
     irr_cols = [c for c in irr.columns if "Irradiance" in c]
@@ -209,8 +227,9 @@ def build_daily_features(
         irradiance_tilted_sum=(tilted_col, "sum"),
         irradiance_records=("Timestamp", "size"),
     )
+    exp_irr = PEAK_IRR_RECORDS_PER_DAY if apply_peak_filter else EXPECTED_IRR_RECORDS_PER_DAY
     irr_daily["irradiance_coverage_ratio"] = (
-        irr_daily["irradiance_records"] / EXPECTED_IRR_RECORDS_PER_DAY
+        irr_daily["irradiance_records"] / exp_irr
     ).clip(upper=1.0)
 
     gen_cols = [c for c in gen.columns if c not in ("Timestamp", "Date", "day")]
@@ -278,7 +297,6 @@ def build_daily_features(
     daily = compute_cross_block_correlation(daily)
 
     # --- Merge Solcast environmental features ---
-    # Always reset the day index to a column first
     if daily.index.name == "day":
         daily = daily.reset_index()
     if "day" not in daily.columns:
@@ -290,6 +308,12 @@ def build_daily_features(
         solcast_daily = solcast_daily.copy()
         solcast_daily["day"] = pd.to_datetime(solcast_daily["day"], errors="coerce")
         daily = daily.merge(solcast_daily, on="day", how="left")
+
+    # --- Soiling feature engineering ---
+    daily = compute_soiling_features(daily)
+
+    # --- Cycle-aware deviation ---
+    daily = compute_cycle_deviation(daily)
 
     # --- Common-overlap window ---
     daily = compute_common_overlap(daily)

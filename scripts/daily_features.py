@@ -29,6 +29,38 @@ MIN_IRRADIANCE_FOR_BASELINE = 50_000.0
 # this are clipped to prevent single-day spikes from corrupting the baseline.
 MAX_NORMALIZED_OUTPUT = 500_000.0
 
+# ---------------------------------------------------------------------------
+# Site configuration (placeholders until confirmed by asset owner)
+# ---------------------------------------------------------------------------
+
+P_NOM_KWP = 75.0                # Nameplate DC capacity per inverter [kWp]
+SURFACE_TILT_DEG = 10.0          # Panel tilt angle [degrees]
+SITE_LAT = 8.561510736689941     # Site latitude [degrees north]
+SITE_LON = 80.65921384406597     # Site longitude [degrees east]
+G_STC = 1000.0                   # Standard Test Conditions irradiance [W/m^2]
+N_INVERTERS_PER_TIER = 3         # Inverters in each tier
+
+PEAK_HOUR_START = 10  # Local time hour, inclusive
+PEAK_HOUR_END = 14    # Local time hour, exclusive
+
+# Expected records per day under peak-hour filtering
+_PEAK_HOURS = PEAK_HOUR_END - PEAK_HOUR_START
+PEAK_INV_RECORDS_PER_DAY = _PEAK_HOURS * (3600 // INVERTER_INTERVAL_S)   # 4h * 6 = 24
+PEAK_IRR_RECORDS_PER_DAY = _PEAK_HOURS * (3600 // IRRADIANCE_INTERVAL_S) # 4h * 4 = 16
+
+# Cleaning campaign windows (start_date, end_date) used by pvlib Kimber model
+CLEANING_CAMPAIGN_DATES = [
+    ("2025-09-20", "2025-09-30"),
+    ("2025-10-20", "2025-10-30"),
+    ("2025-11-20", "2025-11-30"),
+]
+
+SIGNIFICANT_RAIN_MM = 5.0  # Precipitation threshold for "significant rain" [mm]
+
+# Sri Lankan climate seasons for this tropical site (~8.5 deg N)
+_DRY_MONTHS = {1, 2, 3, 6, 7, 8, 9}       # Jan-Mar, Jun-Sep
+_WET_MONTHS = {4, 5, 10, 11, 12}           # Apr-May, Oct-Dec (monsoon)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,6 +94,73 @@ def detect_irradiance_cols(
     tilted_col = tilted[0] if tilted else irr_cols[0]
     horiz_col = horiz[0] if horiz else irr_cols[0]
     return tilted_col, horiz_col
+
+
+# ---------------------------------------------------------------------------
+# Pre-aggregation filtering
+# ---------------------------------------------------------------------------
+
+def filter_peak_hours(
+    df: pd.DataFrame,
+    hour_start: int = PEAK_HOUR_START,
+    hour_end: int = PEAK_HOUR_END,
+) -> Tuple[pd.DataFrame, int]:
+    """Filter sub-daily records to peak sun hours only.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must have a ``Date`` column (datetime).
+    hour_start : int
+        Start hour (inclusive, local time).
+    hour_end : int
+        End hour (exclusive, local time).
+
+    Returns
+    -------
+    (filtered_df, n_removed)
+    """
+    before = len(df)
+    mask = df["Date"].dt.hour.between(hour_start, hour_end - 1)
+    out = df[mask].copy()
+    return out, before - len(out)
+
+
+def filter_irradiance_threshold(
+    df: pd.DataFrame,
+    irr_col: str,
+    threshold: Optional[float] = None,
+    percentile: float = 0.10,
+) -> Tuple[pd.DataFrame, int, float]:
+    """Reject sub-daily irradiance records below a threshold.
+
+    If *threshold* is None it is derived from the data: the *percentile*-th
+    value of daytime (non-zero) irradiance values is used as the floor.  This
+    auto-tunes for the sensor's unit conventions.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain *irr_col*.
+    irr_col : str
+        Name of the irradiance column.
+    threshold : float or None
+        Explicit threshold.  If None, derived from data.
+    percentile : float
+        Quantile of positive irradiance values used when *threshold* is None.
+
+    Returns
+    -------
+    (filtered_df, n_removed, threshold_used)
+    """
+    positive = df[irr_col] > 0
+    if threshold is None:
+        threshold = float(df.loc[positive, irr_col].quantile(percentile))
+
+    before = len(df)
+    mask = df[irr_col] >= threshold
+    out = df[mask].copy()
+    return out, before - len(out), threshold
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +317,21 @@ def aggregate_solcast_daily(
 # Daily aggregation
 # ---------------------------------------------------------------------------
 
-def aggregate_inverter_daily(inv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+def aggregate_inverter_daily(
+    inv: pd.DataFrame,
+    expected_records: int = EXPECTED_INV_RECORDS_PER_DAY,
+) -> Tuple[pd.DataFrame, List[str]]:
     """Build daily inverter aggregates from cleaned 10-min data.
 
     Expects ``inv`` to have a ``day`` column and ``subset_power_w``.
+
+    Parameters
+    ----------
+    inv : pd.DataFrame
+        Cleaned sub-daily inverter data.
+    expected_records : int
+        Expected records per day for computing coverage ratio.  Use
+        ``PEAK_INV_RECORDS_PER_DAY`` when peak-hour filtering is active.
 
     Returns ``(inv_daily, power_cols)`` where ``power_cols`` is the list of
     Active Power column names found.
@@ -251,7 +361,7 @@ def aggregate_inverter_daily(inv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]
         .reset_index()
     )
     inv_daily["inverter_coverage_ratio"] = (
-        inv_daily["inverter_records"] / EXPECTED_INV_RECORDS_PER_DAY
+        inv_daily["inverter_records"] / expected_records
     ).clip(upper=1.0)
 
     return inv_daily, power_cols
@@ -342,10 +452,19 @@ def aggregate_tier_daily(
     return merged
 
 
-def aggregate_irradiance_daily(irr: pd.DataFrame) -> pd.DataFrame:
+def aggregate_irradiance_daily(
+    irr: pd.DataFrame,
+    expected_records: int = EXPECTED_IRR_RECORDS_PER_DAY,
+) -> pd.DataFrame:
     """Build daily irradiance sums from cleaned 15-min data.
 
     Expects ``irr`` to have a ``day`` column.
+
+    Parameters
+    ----------
+    expected_records : int
+        Expected records per day for computing coverage ratio.  Use
+        ``PEAK_IRR_RECORDS_PER_DAY`` when peak-hour filtering is active.
     """
     tilted_col, horiz_col = detect_irradiance_cols(irr.columns)
 
@@ -359,9 +478,133 @@ def aggregate_irradiance_daily(irr: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     irr_daily["irradiance_coverage_ratio"] = (
-        irr_daily["irradiance_records"] / EXPECTED_IRR_RECORDS_PER_DAY
+        irr_daily["irradiance_records"] / expected_records
     ).clip(upper=1.0)
     return irr_daily
+
+
+# ---------------------------------------------------------------------------
+# Per-inverter daily metrics and Performance Ratio
+# ---------------------------------------------------------------------------
+
+def _inverter_names_from_power_cols(power_cols: List[str]) -> List[str]:
+    """Extract inverter name prefixes from Active Power column names."""
+    return [c.replace(" Active Power (W)", "") for c in power_cols]
+
+
+def _safe_col_label(name: str) -> str:
+    """Convert inverter name like 'B2-08' to a column-safe prefix 'b2_08'."""
+    return name.lower().replace("-", "_")
+
+
+def compute_performance_ratio(
+    energy_j: pd.Series,
+    irradiance_tilted_sum: pd.Series,
+    p_nom_kwp: float = P_NOM_KWP,
+    g_stc: float = G_STC,
+    n_inverters: int = 1,
+) -> pd.Series:
+    """Compute dimensionless Performance Ratio.
+
+    PR = E_actual / (P_nom_total * H_POA / G_STC)
+
+    Parameters
+    ----------
+    energy_j : pd.Series
+        Daily energy output [J].
+    irradiance_tilted_sum : pd.Series
+        Daily plane-of-array irradiance sum [W-s/m^2].
+    p_nom_kwp : float
+        Nameplate DC capacity per inverter [kWp].
+    g_stc : float
+        Standard Test Conditions irradiance [W/m^2].
+    n_inverters : int
+        Number of inverters contributing to *energy_j*.
+
+    Returns
+    -------
+    pd.Series
+        Dimensionless PR values, typically in [0, 1].
+    """
+    energy_kwh = energy_j / 3.6e6                         # J -> kWh
+    h_poa_kwh_m2 = irradiance_tilted_sum / (g_stc * 3600) # W-s/m^2 -> kWh/m^2
+    p_nom_total = p_nom_kwp * n_inverters                  # kWp
+
+    pr = energy_kwh / (p_nom_total * h_poa_kwh_m2)
+    return pr.clip(lower=0)
+
+
+def aggregate_per_inverter_daily(
+    inv: pd.DataFrame,
+    irr_daily: pd.DataFrame,
+    p_nom_kwp: float = P_NOM_KWP,
+) -> pd.DataFrame:
+    """Compute per-inverter daily energy, PR, and normalized output.
+
+    Parameters
+    ----------
+    inv : pd.DataFrame
+        Cleaned sub-daily inverter data with ``day`` column.
+    irr_daily : pd.DataFrame
+        Daily irradiance table with ``day`` and ``irradiance_tilted_sum``.
+    p_nom_kwp : float
+        Nameplate DC capacity per single inverter [kWp].
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per day, with ``{inv_label}_energy_j``,
+        ``{inv_label}_pr``, and ``{inv_label}_normalized_output`` for
+        each inverter found.
+    """
+    power_cols = [c for c in inv.columns if c.endswith("Active Power (W)")]
+    if not power_cols:
+        return pd.DataFrame(columns=["day"])
+
+    inv_names = _inverter_names_from_power_cols(power_cols)
+    per_inv_frames: List[pd.DataFrame] = []
+
+    for pcol, name in zip(power_cols, inv_names):
+        label = _safe_col_label(name)
+        energy_step_col = f"__{label}_energy_step"
+        inv[energy_step_col] = inv[pcol] * INVERTER_INTERVAL_S
+
+        agg = (
+            inv.groupby("day")
+            .agg(**{f"{label}_energy_j": (energy_step_col, "sum")})
+            .reset_index()
+        )
+        per_inv_frames.append(agg)
+
+    result = per_inv_frames[0]
+    for extra in per_inv_frames[1:]:
+        result = result.merge(extra, on="day", how="outer")
+
+    result = result.merge(
+        irr_daily[["day", "irradiance_tilted_sum"]], on="day", how="left",
+    )
+
+    for name in inv_names:
+        label = _safe_col_label(name)
+        e_col = f"{label}_energy_j"
+        irr_valid = result["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE
+
+        result[f"{label}_pr"] = np.where(
+            irr_valid,
+            compute_performance_ratio(
+                result[e_col], result["irradiance_tilted_sum"],
+                p_nom_kwp=p_nom_kwp, n_inverters=1,
+            ),
+            np.nan,
+        )
+        result[f"{label}_normalized_output"] = np.where(
+            irr_valid,
+            result[e_col] / result["irradiance_tilted_sum"],
+            np.nan,
+        )
+
+    result = result.drop(columns=["irradiance_tilted_sum"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -615,5 +858,320 @@ def compute_transfer_readiness(daily: pd.DataFrame) -> pd.DataFrame:
     daily["cross_plant_inference_ready"] = daily["transfer_quality_tier"].isin(
         ["high", "medium"]
     )
+
+    return daily
+
+
+# ---------------------------------------------------------------------------
+# Soiling feature engineering
+# ---------------------------------------------------------------------------
+
+def compute_soiling_features(daily: pd.DataFrame) -> pd.DataFrame:
+    """Add soiling-relevant engineered features to the daily table.
+
+    Requires Solcast-derived columns (``rain_day``, ``precipitation_total_mm``,
+    ``pm10_mean``, ``pm25_mean``, ``humidity_mean``, ``wind_speed_10m_mean``).
+    If any are absent the corresponding features are skipped gracefully.
+
+    Modifies *daily* in place and returns it.
+    """
+    has = set(daily.columns)
+
+    def _rain_bool(series: pd.Series) -> pd.Series:
+        """Convert rain_day to a clean boolean Series without deprecation warnings."""
+        return pd.array(series, dtype=pd.BooleanDtype()).fillna(False).astype(bool)
+
+    # --- days_since_last_rain ---
+    if "rain_day" in has:
+        rain = _rain_bool(daily["rain_day"])
+        counter = []
+        n = 0
+        for is_rain in rain:
+            n = 0 if is_rain else n + 1
+            counter.append(n)
+        daily["days_since_last_rain"] = counter
+
+    # --- days_since_significant_rain ---
+    if "precipitation_total_mm" in has:
+        sig_rain = daily["precipitation_total_mm"].fillna(0) >= SIGNIFICANT_RAIN_MM
+        counter = []
+        n = 0
+        for is_sig in sig_rain:
+            n = 0 if is_sig else n + 1
+            counter.append(n)
+        daily["days_since_significant_rain"] = counter
+
+    # --- cumulative PM since rain ---
+    if "pm10_mean" in has and "rain_day" in has:
+        rain = _rain_bool(daily["rain_day"])
+        pm10 = daily["pm10_mean"].fillna(0)
+        acc = []
+        total = 0.0
+        for is_rain, val in zip(rain, pm10):
+            total = val if is_rain else total + val
+            acc.append(total)
+        daily["cumulative_pm10_since_rain"] = acc
+
+    if "pm25_mean" in has and "rain_day" in has:
+        rain = _rain_bool(daily["rain_day"])
+        pm25 = daily["pm25_mean"].fillna(0)
+        acc = []
+        total = 0.0
+        for is_rain, val in zip(rain, pm25):
+            total = val if is_rain else total + val
+            acc.append(total)
+        daily["cumulative_pm25_since_rain"] = acc
+
+    # --- interaction: humidity x PM10 (cementation proxy) ---
+    if "humidity_mean" in has and "pm10_mean" in has:
+        daily["humidity_x_pm10"] = daily["humidity_mean"] * daily["pm10_mean"]
+
+    # --- rolling wind ---
+    if "wind_speed_10m_mean" in has:
+        daily["wind_speed_10m_rolling_7d"] = (
+            daily["wind_speed_10m_mean"].rolling(7, min_periods=3).mean()
+        )
+
+    # --- calendar features ---
+    day_dt = pd.to_datetime(daily["day"], errors="coerce")
+    daily["month"] = day_dt.dt.month
+    daily["season"] = daily["month"].map(
+        lambda m: "dry" if m in _DRY_MONTHS else "wet"
+    )
+
+    return daily
+
+
+# ---------------------------------------------------------------------------
+# pvlib soiling integration
+# ---------------------------------------------------------------------------
+
+def compute_pvlib_soiling_ratio(
+    solcast_soiling_path,
+    solcast_irradiance_path=None,
+) -> pd.DataFrame:
+    """Run pvlib HSU and Kimber soiling models on 10-min Solcast data.
+
+    Returns a daily DataFrame with ``pvlib_soiling_ratio_hsu`` and
+    ``pvlib_soiling_loss_kimber`` columns.  If pvlib is not importable or
+    the Solcast data is incompatible, returns an empty DataFrame.
+
+    Parameters
+    ----------
+    solcast_soiling_path : path-like
+        Solcast environmental CSV (10-min, has precipitation, PM columns).
+    solcast_irradiance_path : path-like, optional
+        Not used directly by soiling models but reserved for future use.
+    """
+    from pathlib import Path
+
+    try:
+        from pvlib.soiling import hsu, kimber
+    except ImportError:
+        print("  [pvlib] pvlib not available -- skipping soiling models")
+        return pd.DataFrame()
+
+    sol_path = Path(solcast_soiling_path)
+    if not sol_path.exists():
+        return pd.DataFrame()
+
+    sol = _load_solcast_csv(sol_path)
+    for c in ["precipitation_rate_mm_h", "pm2.5_micro_g_m3", "pm10_micro_g_m3"]:
+        if c in sol.columns:
+            sol[c] = pd.to_numeric(sol[c], errors="coerce")
+
+    required = {"precipitation_rate_mm_h", "pm2.5_micro_g_m3", "pm10_micro_g_m3"}
+    if not required.issubset(sol.columns):
+        print(f"  [pvlib] Missing columns for soiling models: {required - set(sol.columns)}")
+        return pd.DataFrame()
+
+    sol = sol.dropna(subset=list(required))
+    sol = sol.set_index("period_end").sort_index()
+
+    # --- HSU model ---
+    # pvlib expects rainfall as accumulated mm per step, PM in g/m^3
+    rainfall_mm = sol["precipitation_rate_mm_h"] * (SOLCAST_INTERVAL_S / 3600.0)  # mm per 10-min
+    pm25_g = sol["pm2.5_micro_g_m3"] * 1e-6   # ug/m^3 -> g/m^3
+    pm10_g = sol["pm10_micro_g_m3"] * 1e-6     # ug/m^3 -> g/m^3
+
+    try:
+        hsu_ratio = hsu(
+            rainfall=rainfall_mm,
+            cleaning_threshold=1.0,     # mm accumulated in rain_accum_period to trigger clean
+            surface_tilt=SURFACE_TILT_DEG,
+            pm2_5=pm25_g,
+            pm10=pm10_g,
+            rain_accum_period=pd.Timedelta("1h"),
+        )
+    except Exception as exc:
+        print(f"  [pvlib] HSU model failed: {exc}")
+        hsu_ratio = pd.Series(dtype=float)
+
+    # --- Kimber model ---
+    # Kimber uses daily accumulated rainfall and manual wash dates
+    sol_local = sol.copy()
+    sol_local.index = sol_local.index.tz_convert("Asia/Kolkata")
+    daily_rain = rainfall_mm.resample("D").sum()
+
+    wash_dates = []
+    for start_s, end_s in CLEANING_CAMPAIGN_DATES:
+        start_d = pd.Timestamp(start_s).date()
+        end_d = pd.Timestamp(end_s).date()
+        for d in pd.date_range(start_d, end_d):
+            wash_dates.append(d.date())
+
+    try:
+        kimber_loss = kimber(
+            rainfall=daily_rain,
+            cleaning_threshold=6.0,
+            soiling_loss_rate=0.0015,
+            grace_period=14,
+            max_soiling=0.3,
+            manual_wash_dates=wash_dates,
+        )
+    except Exception as exc:
+        print(f"  [pvlib] Kimber model failed: {exc}")
+        kimber_loss = pd.Series(dtype=float)
+
+    # Aggregate HSU to daily mean ratio
+    results = pd.DataFrame()
+    if not hsu_ratio.empty:
+        hsu_daily = hsu_ratio.resample("D").mean()
+        hsu_df = hsu_daily.reset_index()
+        hsu_df.columns = ["day", "pvlib_soiling_ratio_hsu"]
+        hsu_df["day"] = hsu_df["day"].dt.tz_localize(None)
+        results = hsu_df
+
+    if not kimber_loss.empty:
+        kim_df = kimber_loss.reset_index()
+        kim_df.columns = ["day", "pvlib_soiling_loss_kimber"]
+        kim_df["day"] = kim_df["day"].dt.tz_localize(None)
+        if results.empty:
+            results = kim_df
+        else:
+            results = results.merge(kim_df, on="day", how="outer")
+
+    return results
+
+
+def compute_temperature_corrected_pr(daily: pd.DataFrame) -> pd.DataFrame:
+    """Add temperature-corrected Performance Ratio to the daily table.
+
+    Uses pvlib SAPM cell temperature model with Solcast air temperature,
+    wind speed, and irradiance.  Produces ``pr_temperature_corrected`` by
+    adjusting the Tier-1 PR for thermal effects.
+
+    Requires ``air_temp_mean``, ``wind_speed_10m_mean``, and
+    ``irradiance_tilted_sum`` columns.  Skips gracefully if unavailable.
+    """
+    required = {"air_temp_mean", "wind_speed_10m_mean", "irradiance_tilted_sum"}
+    if not required.issubset(daily.columns):
+        return daily
+
+    try:
+        from pvlib.temperature import sapm_cell, TEMPERATURE_MODEL_PARAMETERS
+    except ImportError:
+        return daily
+
+    params = TEMPERATURE_MODEL_PARAMETERS["sapm"]["open_rack_glass_polymer"]
+
+    # Convert daily irradiance sum (W-s/m^2) to average POA irradiance (W/m^2)
+    # over peak hours (4 hours = 14400 seconds)
+    peak_seconds = (PEAK_HOUR_END - PEAK_HOUR_START) * 3600.0
+    poa_avg = daily["irradiance_tilted_sum"] / peak_seconds
+
+    cell_temp = sapm_cell(
+        poa_global=poa_avg,
+        temp_air=daily["air_temp_mean"],
+        wind_speed=daily["wind_speed_10m_mean"],
+        a=params["a"],
+        b=params["b"],
+        deltaT=params["deltaT"],
+    )
+
+    # Temperature coefficient for crystalline silicon ~ -0.004 /degC
+    temp_coeff = -0.004  # [1/degC]
+    t_stc = 25.0         # [degC]
+    temp_correction_factor = 1.0 + temp_coeff * (cell_temp - t_stc)
+
+    pr_col = "t1_performance_loss_pct_proxy" if "t1_performance_loss_pct_proxy" in daily.columns else "performance_loss_pct_proxy"
+    norm_col = "t1_normalized_output" if "t1_normalized_output" in daily.columns else "normalized_output"
+    baseline_col = "t1_rolling_clean_baseline" if "t1_rolling_clean_baseline" in daily.columns else "rolling_clean_baseline"
+
+    if norm_col in daily.columns and baseline_col in daily.columns:
+        corrected_output = daily[norm_col] / temp_correction_factor
+        daily["pr_temperature_corrected"] = (
+            100.0 * (1.0 - corrected_output / daily[baseline_col])
+        ).clip(lower=0, upper=100)
+
+    return daily
+
+
+# ---------------------------------------------------------------------------
+# Cycle-aware deviation feature
+# ---------------------------------------------------------------------------
+
+def compute_cycle_deviation(
+    daily: pd.DataFrame,
+    energy_col: str = "subset_energy_j",
+    irr_sum_col: str = "irradiance_tilted_sum",
+) -> pd.DataFrame:
+    """Add cycle-aware soiling deviation feature.
+
+    X = energy / (irr_sum / tracked_time)  -- normalised by average
+    irradiance rate, more robust than raw irr_sum when data coverage varies.
+
+    Cycles are delimited by rain events or cleaning campaigns.  Within each
+    cycle the max(X) represents "just cleaned" performance; the deviation
+    from that max tracks soiling accumulation.
+
+    Produces ``cycle_id``, ``soiling_index_x``, ``cycle_max_x``, and
+    ``cycle_deviation_pct`` columns.
+
+    Modifies *daily* in place and returns it.
+    """
+    if energy_col not in daily.columns or irr_sum_col not in daily.columns:
+        return daily
+
+    # Tracked time in seconds (from inverter record count)
+    if "inverter_records" in daily.columns:
+        tracked_time = daily["inverter_records"] * INVERTER_INTERVAL_S
+    else:
+        tracked_time = pd.Series(
+            (PEAK_HOUR_END - PEAK_HOUR_START) * 3600.0, index=daily.index,
+        )
+
+    mean_irr_rate = daily[irr_sum_col] / tracked_time
+    mean_irr_rate = mean_irr_rate.replace(0, np.nan)
+    soiling_x = daily[energy_col] / mean_irr_rate
+
+    # Determine cycle boundaries
+    day_dt = pd.to_datetime(daily["day"], errors="coerce")
+    if "rain_day" in daily.columns:
+        is_rain = pd.array(daily["rain_day"], dtype=pd.BooleanDtype()).fillna(False).astype(bool)
+        is_rain = pd.Series(is_rain, index=daily.index)
+    else:
+        is_rain = pd.Series(False, index=daily.index)
+
+    # Mark cleaning campaign days
+    is_clean = pd.Series(False, index=daily.index)
+    for start_s, end_s in CLEANING_CAMPAIGN_DATES:
+        start = pd.Timestamp(start_s)
+        end = pd.Timestamp(end_s)
+        is_clean = is_clean | ((day_dt >= start) & (day_dt <= end))
+
+    is_reset = is_rain | is_clean
+    cycle_id = is_reset.cumsum()
+
+    daily["cycle_id"] = cycle_id.values
+    daily["soiling_index_x"] = soiling_x.values
+
+    # Max X within each cycle (forward-looking max from cycle start)
+    cycle_max = daily.groupby("cycle_id")["soiling_index_x"].transform("max")
+    daily["cycle_max_x"] = cycle_max
+
+    daily["cycle_deviation_pct"] = (
+        100.0 * (1.0 - daily["soiling_index_x"] / daily["cycle_max_x"])
+    ).clip(lower=0, upper=100)
 
     return daily

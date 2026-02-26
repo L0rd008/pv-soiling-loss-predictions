@@ -10,7 +10,7 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Ensure sibling modules (daily_features) are importable from any cwd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,16 +22,30 @@ from daily_features import (
     INVERTER_INTERVAL_S,
     MIN_IRRADIANCE_FOR_BASELINE,
     MAX_NORMALIZED_OUTPUT,
+    PEAK_HOUR_START,
+    PEAK_HOUR_END,
+    PEAK_INV_RECORDS_PER_DAY,
+    PEAK_IRR_RECORDS_PER_DAY,
+    P_NOM_KWP,
     aggregate_block_daily,
     aggregate_inverter_daily,
     aggregate_irradiance_daily,
+    aggregate_per_inverter_daily,
     aggregate_solcast_daily,
     aggregate_tier_daily,
     compute_common_overlap,
     compute_cross_block_correlation,
-    compute_quality_flags,
+    compute_cycle_deviation,
     compute_performance_features,
+    compute_performance_ratio,
+    compute_pvlib_soiling_ratio,
+    compute_quality_flags,
+    compute_soiling_features,
+    compute_temperature_corrected_pr,
     compute_transfer_readiness,
+    detect_irradiance_cols,
+    filter_irradiance_threshold,
+    filter_peak_hours,
 )
 
 MAX_POWER_W = 300_000.0
@@ -172,6 +186,8 @@ def build_daily_model_table(
     irradiance: pd.DataFrame,
     generation_daily: pd.DataFrame,
     solcast_daily: pd.DataFrame = None,
+    pvlib_soiling_daily: pd.DataFrame = None,
+    peak_filtered: bool = False,
 ) -> pd.DataFrame:
     """Build the daily model input table from cleaned sub-daily data.
 
@@ -182,14 +198,25 @@ def build_daily_model_table(
     - Combined (all inverters): backward-compatible ``performance_loss_pct_proxy``
     - Tier-1 (B2 training): ``t1_performance_loss_pct_proxy``
     - Tier-2 (B1 validation): ``t2_performance_loss_pct_proxy``
-    Plus cross-block correlation columns.
+    Plus per-inverter PR, soiling features, pvlib soiling estimates,
+    cycle deviation, cross-block correlation, and temperature correction.
+
+    Parameters
+    ----------
+    peak_filtered : bool
+        If True, coverage ratios use peak-hour expected record counts
+        instead of full-day counts.
     """
     inv = inverters.copy()
     irr = irradiance.copy()
     gen = generation_daily.copy()
 
+    inv_expected = PEAK_INV_RECORDS_PER_DAY if peak_filtered else None
+    irr_expected = PEAK_IRR_RECORDS_PER_DAY if peak_filtered else None
+
     # --- Inverter daily aggregation (combined) ---
-    inv_daily, power_cols = aggregate_inverter_daily(inv)
+    agg_kwargs_inv = {} if inv_expected is None else {"expected_records": inv_expected}
+    inv_daily, power_cols = aggregate_inverter_daily(inv, **agg_kwargs_inv)
 
     # --- Block (B1 vs B2) daily aggregation ---
     block_daily = aggregate_block_daily(inv, power_cols)
@@ -202,7 +229,13 @@ def build_daily_model_table(
         inv_daily = inv_daily.merge(tier_daily, on="day", how="left")
 
     # --- Irradiance daily aggregation ---
-    irr_daily = aggregate_irradiance_daily(irr)
+    agg_kwargs_irr = {} if irr_expected is None else {"expected_records": irr_expected}
+    irr_daily = aggregate_irradiance_daily(irr, **agg_kwargs_irr)
+
+    # --- Per-inverter daily metrics (energy, PR, normalized output) ---
+    per_inv = aggregate_per_inverter_daily(inv, irr_daily, p_nom_kwp=P_NOM_KWP)
+    if not per_inv.empty:
+        inv_daily = inv_daily.merge(per_inv, on="day", how="left")
 
     # --- Merge all daily tables ---
     daily = (
@@ -215,6 +248,10 @@ def build_daily_model_table(
     # --- Solcast environmental features ---
     if solcast_daily is not None and not solcast_daily.empty:
         daily = daily.merge(solcast_daily, on="day", how="left")
+
+    # --- pvlib soiling estimates ---
+    if pvlib_soiling_daily is not None and not pvlib_soiling_daily.empty:
+        daily = daily.merge(pvlib_soiling_daily, on="day", how="left")
 
     # --- Derived energy columns ---
     daily["subset_energy_mwh"] = daily["subset_energy_j"] / 3.6e9
@@ -231,8 +268,25 @@ def build_daily_model_table(
     # Tier-2 (B1 validation signal)
     daily = compute_performance_features(daily, energy_col="t2_energy_j", prefix="t2")
 
+    # --- Combined PR (all tiered inverters) ---
+    n_power_cols = len(power_cols)
+    if "irradiance_tilted_sum" in daily.columns and n_power_cols > 0:
+        daily["subset_pr"] = compute_performance_ratio(
+            daily["subset_energy_j"], daily["irradiance_tilted_sum"],
+            p_nom_kwp=P_NOM_KWP, n_inverters=n_power_cols,
+        )
+
     # --- Cross-block correlation ---
     daily = compute_cross_block_correlation(daily)
+
+    # --- Soiling feature engineering ---
+    daily = compute_soiling_features(daily)
+
+    # --- Cycle-aware deviation ---
+    daily = compute_cycle_deviation(daily)
+
+    # --- Temperature correction ---
+    daily = compute_temperature_corrected_pr(daily)
 
     # --- Common-overlap window ---
     daily = compute_common_overlap(daily)
@@ -254,6 +308,7 @@ def write_preprocessing_summary(
     irr_stats: Dict[str, float],
     gen_stats: Dict[str, float],
     daily: pd.DataFrame,
+    filter_stats: Optional[Dict[str, object]] = None,
 ) -> None:
     """Write a human-readable preprocessing summary report."""
     total_days = len(daily)
@@ -290,6 +345,40 @@ def write_preprocessing_summary(
             f"- Block mismatch flagged days: {blk_mismatch}",
         ]
 
+    # Peak-hour filtering stats
+    filter_lines = []
+    if filter_stats:
+        filter_lines = [
+            "",
+            "## Pre-Aggregation Filtering",
+            f"- Peak-hour filter: {filter_stats.get('peak_hours', 'disabled')}",
+            f"- Inverter records removed (peak-hour): {filter_stats.get('inv_peak_removed', 'n/a')}",
+            f"- Irradiance records removed (peak-hour): {filter_stats.get('irr_peak_removed', 'n/a')}",
+            f"- Irradiance records removed (threshold): {filter_stats.get('irr_threshold_removed', 'n/a')}",
+            f"- Irradiance threshold used: {filter_stats.get('irr_threshold_value', 'n/a')}",
+        ]
+
+    # Soiling features
+    soiling_lines = []
+    soiling_cols = [c for c in daily.columns if c.startswith(("days_since", "cumulative_pm", "humidity_x", "cycle_", "pvlib_", "pr_temperature"))]
+    if soiling_cols:
+        soiling_lines = [
+            "",
+            "## Soiling Features",
+            f"- Soiling-specific columns added: {len(soiling_cols)}",
+            f"- Columns: {', '.join(sorted(soiling_cols))}",
+        ]
+
+    # Per-inverter columns
+    per_inv_cols = [c for c in daily.columns if c.endswith(("_energy_j", "_pr", "_normalized_output")) and c.startswith(("b1_", "b2_")) and "_data_" not in c and "block_" not in c]
+    per_inv_lines = []
+    if per_inv_cols:
+        per_inv_lines = [
+            "",
+            "## Per-Inverter Metrics",
+            f"- Per-inverter columns: {len(per_inv_cols)}",
+        ]
+
     lines = [
         "# Preprocessing Summary",
         "",
@@ -298,6 +387,7 @@ def write_preprocessing_summary(
         "- Intended use: build features that can inform cross-plant inference with quality gating.",
         "- Tier-1 (training): B2-08, B2-13, B2-17 (~93-95% availability)",
         "- Tier-2 (validation): B1-08, B1-01, B1-13 (~54% availability)",
+        f"- Nameplate capacity per inverter (placeholder): {P_NOM_KWP} kWp",
         "",
         "## Cleaning Statistics",
         f"- Inverters rows: {int(inv_stats['rows'])}",
@@ -314,6 +404,7 @@ def write_preprocessing_summary(
         "",
         "## Daily Modeling Table",
         f"- Total daily rows: {total_days}",
+        f"- Total columns: {len(daily.columns)}",
         f"- Days with >=1 flag: {total_flagged}",
         f"- Cross-plant inference ready days: {ready_days}/{total_days}",
         f"- Transfer tier counts: high={high_days}, medium={medium_days}, low={low_days}",
@@ -328,13 +419,14 @@ def write_preprocessing_summary(
         f"- Coverage gap days: {cov_gap}",
         f"- Block mismatch days: {blk_mismatch}",
         f"- Low output under high irradiance days: {low_out}",
-    ] + block_lines + [
+    ] + block_lines + filter_lines + soiling_lines + per_inv_lines + [
         "",
         "## Notes",
         "- Transfer readiness is quality-gated and should be recalibrated when onboarded to another plant.",
         "- Features sensitive to plant design (DC/AC ratio, orientation, clipping behavior) should be normalized before portfolio-wide comparisons.",
         f"- Normalized output capped at {MAX_NORMALIZED_OUTPUT:,.0f} to prevent baseline corruption.",
         f"- Days with irradiance below {MIN_IRRADIANCE_FOR_BASELINE:,.0f} W·s/m² excluded from baseline.",
+        f"- P_NOM_KWP = {P_NOM_KWP} kWp is a placeholder; replace with confirmed value from asset owner.",
     ]
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -361,6 +453,12 @@ def main() -> None:
         default=False,
         help="If set, daily_model_input.csv is trimmed to common-overlap days only.",
     )
+    parser.add_argument(
+        "--no-peak-filter",
+        action="store_true",
+        default=False,
+        help="Disable peak-hour and irradiance-threshold filtering (use all records).",
+    )
     args = parser.parse_args()
 
     # Prefer tiered primary file if it exists (produced by split_inverter_tiers.py),
@@ -385,6 +483,33 @@ def main() -> None:
     irr_clean, irr_stats = clean_irradiance(irradiance_path)
     gen_clean, gen_daily, gen_stats = clean_generation(generation_path)
 
+    # --- Peak-hour and irradiance-threshold filtering ---
+    filter_stats: Dict[str, object] = {}
+    if not args.no_peak_filter:
+        inv_clean, inv_peak_removed = filter_peak_hours(inv_clean)
+        irr_clean, irr_peak_removed = filter_peak_hours(irr_clean)
+        print(f"  Peak-hour filter ({PEAK_HOUR_START}:00-{PEAK_HOUR_END}:00): "
+              f"inverter records removed={inv_peak_removed}, "
+              f"irradiance records removed={irr_peak_removed}")
+
+        tilted_col, _ = detect_irradiance_cols(irr_clean.columns)
+        irr_clean, irr_thr_removed, irr_thr_value = filter_irradiance_threshold(
+            irr_clean, tilted_col,
+        )
+        print(f"  Irradiance threshold filter: removed={irr_thr_removed}, "
+              f"threshold={irr_thr_value:.2f}")
+
+        filter_stats = {
+            "peak_hours": f"{PEAK_HOUR_START}:00-{PEAK_HOUR_END}:00",
+            "inv_peak_removed": inv_peak_removed,
+            "irr_peak_removed": irr_peak_removed,
+            "irr_threshold_removed": irr_thr_removed,
+            "irr_threshold_value": f"{irr_thr_value:.2f}",
+        }
+    else:
+        print("  Peak-hour filtering disabled (--no-peak-filter)")
+        filter_stats = {"peak_hours": "disabled"}
+
     # Aggregate Solcast to daily (if available)
     solcast_daily = None
     if solcast_soiling_path.exists():
@@ -392,7 +517,18 @@ def main() -> None:
         solcast_daily = aggregate_solcast_daily(solcast_soiling_path, sc_irr)
         print(f"  Solcast daily features: {len(solcast_daily)} days, {len(solcast_daily.columns)} columns")
 
-    daily_model = build_daily_model_table(inv_clean, irr_clean, gen_daily, solcast_daily)
+    # Compute pvlib soiling estimates (if Solcast soiling data exists)
+    pvlib_soiling_daily = None
+    if solcast_soiling_path.exists():
+        sc_irr_path = solcast_irradiance_path if solcast_irradiance_path.exists() else None
+        pvlib_soiling_daily = compute_pvlib_soiling_ratio(solcast_soiling_path, sc_irr_path)
+        if not pvlib_soiling_daily.empty:
+            print(f"  pvlib soiling estimates: {len(pvlib_soiling_daily)} days")
+
+    daily_model = build_daily_model_table(
+        inv_clean, irr_clean, gen_daily, solcast_daily, pvlib_soiling_daily,
+        peak_filtered=not args.no_peak_filter,
+    )
 
     inv_clean.to_csv(args.out_dir / "inverters_clean.csv", index=False)
     irr_clean.to_csv(args.out_dir / "irradiance_clean.csv", index=False)
@@ -419,6 +555,7 @@ def main() -> None:
         irr_stats,
         gen_stats,
         daily_model,
+        filter_stats,
     )
 
     print(f"Preprocessing complete. Outputs written to: {args.out_dir}")
