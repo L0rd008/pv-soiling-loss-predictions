@@ -5,6 +5,7 @@ and how previously raised concerns are handled in the current pipeline.
 
 ## Operational Context (Plant-Specific)
 
+- Site location: 8.561510736689941, 80.65921384406597
 - Plant size: 10-15 MW.
 - Full plant inverters: 34.
 - Current sampled inverters in dataset: 8 (4 from `B1`, 4 from `B2`).
@@ -98,7 +99,10 @@ Resolution:
 Current recommendation:
 - Keep proxy for monitoring/ranking.
 - Build validated labels using O&M logs before supervised failure modeling.
-- Introduce physical normalization (for example with pvlib) in a later modeling stage.
+- Temperature correction is now implemented via `pvlib.temperature.sapm_cell()`
+  in `scripts/daily_features.py`: `compute_temperature_corrected_pr()`.
+  The `pr_temperature_corrected` column partially removes thermal effects
+  from the performance loss proxy.
 
 ### 5) Environmental drivers and available data
 
@@ -168,6 +172,30 @@ Provided candidates:
 Constraint:
 - Keep exactly 4 devices per block in analysis sets for block comparability.
 
+### 9) Ground irradiance sensor soiling detection
+
+Concern:
+- The ground irradiance sensor (`irradiance_tilted_sum`) may itself accumulate
+  dirt over time. If the sensor is soiled, all normalized output and performance
+  loss calculations are biased — the denominator is artificially low, making
+  panels appear to perform better than they actually are (or masking real
+  soiling trends).
+
+Resolution:
+- Cross-check Solcast satellite GTI (`solcast_gti_sum`) against the ground-sensor
+  `irradiance_tilted_sum`. Persistent divergence where satellite reads
+  consistently higher than the ground sensor suggests sensor soiling.
+- Sudden convergence after a known cleaning campaign would further confirm this.
+- Note: some divergence is expected due to measurement methodology differences
+  (satellite model vs pyranometer). The diagnostic is based on *trend* in the
+  ratio, not absolute level.
+
+Where to implement:
+- Check during EDA (bivariate plot of `solcast_gti_sum` vs
+  `irradiance_tilted_sum` over time, and their ratio trend).
+- If confirmed as a recurring issue, add a daily quality flag
+  (e.g., `flag_sensor_soiling_suspect`) based on a rolling ratio threshold.
+
 ## Cross-Plant Inference Guidance
 
 This repository is built on one plant but intended to inform others.
@@ -178,6 +206,26 @@ Rules:
 - separate transferable patterns from plant-specific operational behavior.
 
 ## Open Items and Resolution Status
+
+### ⚠️ Known: Ground irradiance sensor unit ambiguity
+
+- The ground irradiance sensor values (labelled `W·s/m²` in the data dictionary)
+  are actually sums of sub-minute W/m² readings produced by ThingsBoard's `SUM`
+  aggregation over 15-minute windows — not true energy-density values.
+- Cross-referencing against Solcast GTI (confirmed W/m² → W·s/m² via `gti_w_m2 *
+  600s`), the ground sensor values are ~140× smaller than true W·s/m².
+- **Impact on EDA:** `normalized_output` and `performance_loss_pct_proxy` use
+  the ground sensor value as a ratio denominator. The **relative trends**
+  (sawtooth patterns, cleaning jumps, soiling slopes) are scale-independent
+  and unaffected by this issue.
+- **Impact on PR:** Per-inverter `{inv}_pr` and `subset_pr` values are
+  systematically inflated (~200×) because the PR formula assumes the irradiance
+  is in true W·s/m². These values are useful for **relative trend analysis**
+  (sawtooth shape, cleaning detection) but not for industry-standard benchmarking
+  until the irradiance scale is calibrated.
+- **Calibration path:** Use `solcast_gti_sum / irradiance_tilted_sum` ratio
+  to derive a day-level correction factor, or switch the PR denominator to
+  Solcast GTI for a properly-scaled reference PR.
 
 ### ✅ Resolved: Native unit of `EnergyMeter_dailyGeneration`
 
