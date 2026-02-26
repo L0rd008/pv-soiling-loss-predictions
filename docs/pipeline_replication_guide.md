@@ -1,6 +1,7 @@
 # Pipeline Replication Guide
 
-This is the entry point for reproducing the project pipeline exactly, from ThingsBoard fetch to EDA-ready daily tables.
+This is the entry point for reproducing the project pipeline exactly, from
+ThingsBoard fetch through EDA signal analysis.
 
 Detailed stage guides:
 
@@ -8,10 +9,13 @@ Detailed stage guides:
 2. `docs/pipeline_replication/02_cleaning_preprocessing.md`
 3. `docs/pipeline_replication/03_audit_validation.md`
 4. `docs/pipeline_replication/04_eda_guide_daily_model_eda.md`
+5. `docs/pipeline_replication/05_eda_soiling_signals.md`
 
 ## Why This Is Split
 
-The previous single file mixed fetching, cleaning, preprocessing, and audit details in one place. Splitting by stage keeps each section maintainable and aligned with the scripts.
+The previous single file mixed fetching, cleaning, preprocessing, and audit
+details in one place. Splitting by stage keeps each section maintainable and
+aligned with the scripts.
 
 ## End-to-End Order
 
@@ -19,6 +23,7 @@ The previous single file mixed fetching, cleaning, preprocessing, and audit deta
 2. Build tiered inverter files (`primary` and `secondary`).
 3. Run deterministic cleaning and preprocessing.
 4. Run audit and validation outputs.
+5. Run EDA soiling signal analysis.
 
 ## Quick Run
 
@@ -29,6 +34,7 @@ python scripts/power_generation_data_fetch.py
 python scripts/split_inverter_tiers.py
 python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocessed
 python scripts/data_quality_audit.py --data-dir data --out-dir artifacts/audit
+python scripts/eda_soiling_signals.py
 ```
 
 Optional:

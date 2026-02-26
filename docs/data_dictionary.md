@@ -191,6 +191,67 @@ Cross-plant transfer fields:
 | `period_end` | datetime | ISO 8601 | Period end timestamp |
 | `period` | string | ISO 8601 | Duration of period (PT10M) |
 
+## Per-Inverter Metrics (in `daily_model_input.csv`)
+
+Computed by `aggregate_per_inverter_daily()` for each of the 6 tiered inverters.
+Column names use the pattern `{inv_label}_*` where `inv_label` is the lowercase
+inverter name with hyphens replaced by underscores (e.g. `b2_08`).
+
+| Column Pattern | Type | Unit | Description |
+|---|---|---|---|
+| `{inv}_energy_j` | float64 | J | Daily energy for individual inverter |
+| `{inv}_pr` | float64 | dimensionless | Performance Ratio using `P_NOM_KWP` placeholder |
+| `{inv}_normalized_output` | float64 | J/(W-s/m^2) | Per-inverter normalized output |
+
+Combined PR:
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `subset_pr` | float64 | dimensionless | Combined PR for all tiered inverters |
+
+## Soiling Features (in `daily_model_input.csv`)
+
+Computed by `compute_soiling_features()`. Require Solcast columns to be present.
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `days_since_last_rain` | int | days | Consecutive days since last `rain_day == True` |
+| `days_since_significant_rain` | int | days | Days since `precipitation_total_mm >= 5.0 mm` |
+| `cumulative_pm10_since_rain` | float64 | ug/m^3-days | Running sum of `pm10_mean` reset on rain days |
+| `cumulative_pm25_since_rain` | float64 | ug/m^3-days | Running sum of `pm25_mean` reset on rain days |
+| `humidity_x_pm10` | float64 | %*ug/m^3 | `humidity_mean * pm10_mean` (cementation proxy) |
+| `wind_speed_10m_rolling_7d` | float64 | m/s | 7-day rolling mean of `wind_speed_10m_mean` |
+| `month` | int | 1-12 | Calendar month |
+| `season` | string | category | `dry` (Jan-Mar, Jun-Sep) or `wet` (Apr-May, Oct-Dec) |
+
+## pvlib Soiling Estimates (in `daily_model_input.csv`)
+
+Computed by `compute_pvlib_soiling_ratio()` from 10-min Solcast data.
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `pvlib_soiling_ratio_hsu` | float64 | ratio 0-1 | Daily mean HSU soiling ratio (1 = clean) |
+| `pvlib_soiling_loss_kimber` | float64 | fraction 0-0.3 | Kimber soiling loss fraction (0 = clean) |
+
+## Temperature Correction (in `daily_model_input.csv`)
+
+Computed by `compute_temperature_corrected_pr()` using pvlib SAPM model.
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `pr_temperature_corrected` | float64 | % | Performance loss proxy with thermal effects removed |
+
+## Cycle-Aware Deviation (in `daily_model_input.csv`)
+
+Computed by `compute_cycle_deviation()`. Cycles are delimited by rain or cleaning events.
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `cycle_id` | int | count | Cycle identifier, increments at each rain/cleaning reset |
+| `soiling_index_x` | float64 | J*s | X = energy / mean_irradiance_rate |
+| `cycle_max_x` | float64 | J*s | Max X within the current cycle |
+| `cycle_deviation_pct` | float64 | % 0-100 | `100 * (1 - X / cycle_max_x)` |
+
 ## Audit Outputs (`artifacts/audit/`)
 
 `scripts/data_quality_audit.py` produces:
@@ -200,3 +261,52 @@ Cross-plant transfer fields:
 - `daily_features.csv`
 - `daily_flags.csv`
 - `quality_summary.md`
+
+## EDA Outputs (`artifacts/eda/`)
+
+`scripts/eda_soiling_signals.py` produces a quantitative signal report and
+17 diagnostic plots. See `docs/eda_output_interpretation.md` for how to read
+each output.
+
+### Report
+
+| File | Description |
+|---|---|
+| `eda_signal_report.md` | Go/no-go verdicts for three soiling signals with quantitative metrics |
+
+### Signal 1 Plots (Sawtooth Detection)
+
+| File | Description |
+|---|---|
+| `plots/s1_loss_proxy_timeseries.png` | Loss proxy time-series with rain and cleaning overlays |
+| `plots/s1_per_inverter_output.png` | Per-inverter normalised output (6 panels) |
+| `plots/s1_cycle_deviation.png` | Cycle-aware deviation time-series with cycle boundaries |
+| `plots/s1_dryspell_slopes.png` | Linear soiling rates fitted within dry spells |
+
+### Signal 2 Plots (PM/Dust Correlation)
+
+| File | Description |
+|---|---|
+| `plots/s2_pm10_scatter_panels.png` | PM10 vs loss rate, raw and clear-sky deconfounded |
+| `plots/s2_cumulative_pm10_vs_deviation.png` | Cumulative dust exposure vs cycle deviation |
+| `plots/s2_feature_heatmap.png` | Feature correlation matrix (environmental, engineered, targets) |
+
+### Signal 3 Plots (Rain Recovery)
+
+| File | Description |
+|---|---|
+| `plots/s3_rain_event_study.png` | Mean loss trajectory around significant rain events |
+| `plots/s3_dryspell_start_end.png` | Paired comparison: dry-spell start vs end loss |
+| `plots/s3_recovery_vs_precipitation.png` | Recovery magnitude vs rainfall amount |
+| `plots/s3_rain_event_study_seasonal.png` | Seasonal split of rain event study |
+
+### Supporting Analysis Plots
+
+| File | Description |
+|---|---|
+| `plots/s4_univariate_distributions.png` | Histograms of loss proxy, precipitation, PM10 |
+| `plots/s4_pvlib_vs_observed.png` | pvlib soiling estimate vs observed proxy |
+| `plots/s4_sensor_dirt_check.png` | Solcast/ground sensor ratio trend over time |
+| `plots/s4_tier_validation.png` | T1 vs T2 loss proxy overlay |
+| `plots/s4_seasonal_boxplots.png` | Monthly loss distribution box plots |
+| `plots/s4_quality_gating.png` | Quality score distribution and tier counts |

@@ -361,6 +361,11 @@ Composite quality scoring for cross-plant model transfer.
 
 ## Recommended EDA Workflow
 
+This workflow has been implemented as `scripts/eda_soiling_signals.py`.
+See `docs/pipeline_replication/05_eda_soiling_signals.md` for run
+instructions and `docs/eda_output_interpretation.md` for how to read
+each output plot.
+
 1. **Univariate:** Distribution of `t1_performance_loss_pct_proxy`, `precipitation_total_mm`, `pm10_mean`
 2. **Bivariate:** Scatter `pm10_mean` vs. `t1_performance_loss_pct_proxy`; time-series of loss proxy with rain events overlaid
 3. **Soiling cycle detection:** Identify sawtooth pattern - gradual loss increase -> sudden drop (rain cleaning)
