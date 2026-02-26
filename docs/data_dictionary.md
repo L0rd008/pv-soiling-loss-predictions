@@ -291,7 +291,7 @@ each output.
 
 | File | Description |
 |---|---|
-| `plots/s1_loss_proxy_timeseries.png` | Loss proxy time-series with rain and cleaning overlays |
+| `plots/s1_loss_proxy_timeseries.png` | Loss proxy & domain soiling index time-series with rain/cleaning overlays |
 | `plots/s1_per_inverter_output.png` | Per-inverter normalised output (6 panels) |
 | `plots/s1_cycle_deviation.png` | Cycle-aware deviation time-series with cycle boundaries |
 | `plots/s1_dryspell_slopes.png` | Linear soiling rates fitted within dry spells |
@@ -317,8 +317,8 @@ each output.
 
 | File | Description |
 |---|---|
-| `plots/s4_univariate_distributions.png` | Histograms of loss proxy, precipitation, PM10 |
-| `plots/s4_pvlib_vs_observed.png` | pvlib soiling estimate vs observed proxy |
+| `plots/s4_univariate_distributions.png` | Histograms of loss proxy, precipitation, PM10, cycle deviation, DSPI daily rate, loss rate (2x3 grid) |
+| `plots/s4_pvlib_vs_observed.png` | Physics-based estimates (pvlib + DSPI) vs observed proxy (2x2 grid) |
 | `plots/s4_sensor_dirt_check.png` | Solcast/ground sensor ratio trend over time |
 | `plots/s4_tier_validation.png` | T1 vs T2 loss proxy overlay |
 | `plots/s4_seasonal_boxplots.png` | Monthly loss distribution box plots |

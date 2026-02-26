@@ -71,7 +71,7 @@ All saved to `artifacts/eda/plots/`:
 
 | Plot | Signal | Description |
 |---|---|---|
-| `s1_loss_proxy_timeseries.png` | 1 | Loss proxy time-series with rain and cleaning overlays |
+| `s1_loss_proxy_timeseries.png` | 1 | Loss proxy & domain soiling index time-series with rain/cleaning overlays |
 | `s1_per_inverter_output.png` | 1 | Per-inverter normalised output (6 panels) |
 | `s1_cycle_deviation.png` | 1 | Cycle-aware deviation time-series |
 | `s1_dryspell_slopes.png` | 1 | Linear soiling rates fitted within dry spells |
@@ -82,8 +82,8 @@ All saved to `artifacts/eda/plots/`:
 | `s3_dryspell_start_end.png` | 3 | Paired comparison: dry-spell start vs end loss |
 | `s3_recovery_vs_precipitation.png` | 3 | Recovery magnitude vs rainfall amount |
 | `s3_rain_event_study_seasonal.png` | 3 | Seasonal split of rain event study |
-| `s4_univariate_distributions.png` | Support | Histograms of loss proxy, precipitation, PM10 |
-| `s4_pvlib_vs_observed.png` | Support | pvlib soiling estimate vs observed proxy |
+| `s4_univariate_distributions.png` | Support | Histograms of loss proxy, precipitation, PM10, cycle deviation, DSPI daily rate, loss rate (2x3) |
+| `s4_pvlib_vs_observed.png` | Support | Physics-based estimates (pvlib + DSPI) vs observed proxy (2x2) |
 | `s4_sensor_dirt_check.png` | Support | Solcast/ground sensor ratio trend |
 | `s4_tier_validation.png` | Support | T1 vs T2 loss proxy overlay |
 | `s4_seasonal_boxplots.png` | Support | Monthly loss distribution box plots |

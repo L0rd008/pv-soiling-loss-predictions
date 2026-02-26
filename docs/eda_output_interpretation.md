@@ -155,9 +155,13 @@ noise do not produce this shape.
 
 **Layout**: Two vertically-stacked panels sharing the same time axis.
 
-- **Top panel**: `t1_performance_loss_pct_proxy` (Tier-1 loss proxy) plotted
-  over the full date range. Higher values mean worse performance relative to
-  the rolling clean baseline.
+- **Top panel**: Two metrics on dual axes.
+  - Left y-axis (purple): `t1_performance_loss_pct_proxy` (Tier-1 loss proxy).
+    Higher values mean worse performance relative to the rolling clean baseline.
+  - Right y-axis (amber, faint): `domain_soiling_index` (cumulative DSPI).
+    This is a physics-based soiling pressure estimate built entirely from
+    environmental data (PM, humidity, precipitation). It rises during dry,
+    dusty periods and resets after significant rain or cleaning.
   - Faint blue vertical lines mark days with significant rain (>= 5 mm).
   - Shaded orange bands mark the three known cleaning campaigns (Sep/Oct/Nov
     2025, 20th-30th).
@@ -165,14 +169,20 @@ noise do not produce this shape.
 
 **What to look for**:
 
-- Gradual upward slopes between rain events (soiling accumulation).
+- Gradual upward slopes between rain events (soiling accumulation) in the
+  loss proxy.
 - Sudden downward steps at rain lines or within cleaning bands (recovery).
 - Multi-week ascending runs during dry spells, especially Feb-Apr.
+- Whether the amber DSPI line rises and falls at similar times as the loss
+  proxy. Agreement indicates the physics-based model captures the same
+  soiling dynamics that the plant performance data shows. Divergences may
+  reveal periods dominated by non-soiling losses (equipment issues, clouds).
 
 **Caveat**: This plot shows all data, not just high-quality days. Cloudy periods
 depress normalised output against the clear-sky baseline, so loss proxy spikes
 on overcast days are weather artefacts, not soiling. Focus on trends during
-clear, dry stretches.
+clear, dry stretches. The DSPI line is unaffected by clouds since it uses
+only environmental satellite data.
 
 ### s1_per_inverter_output.png
 
@@ -448,35 +458,58 @@ and making modeling decisions.
 
 ### s4_univariate_distributions.png
 
-**Layout**: Three side-by-side histograms on HQ days.
+**Layout**: 2x3 grid of histograms on HQ days.
 
-- Left: `t1_performance_loss_pct_proxy`. Look for a large spike at 0% (days
-  where output met or exceeded baseline) and a right-skewed tail. The 117
-  zero-loss days are structurally expected (the proxy clips at 0).
-- Centre: `precipitation_total_mm`. Heavy right skew with many low-rain days
-  and a few heavy events (up to ~90 mm). Most days have some rain (this is a
-  tropical site).
-- Right: `pm10_mean`. Should be roughly symmetric or slightly right-skewed,
-  centred around 50-55 ug/m3.
+- **Row 1** (primary variables):
+  - Left: `t1_performance_loss_pct_proxy`. Look for a large spike at 0% (days
+    where output met or exceeded baseline) and a right-skewed tail. Zero-loss
+    days are structurally expected (the proxy clips at 0).
+  - Centre: `precipitation_total_mm`. Heavy right skew with many low-rain days
+    and a few heavy events (up to ~90 mm). Most days have some rain (tropical
+    site).
+  - Right: `pm10_mean`. Should be roughly symmetric or slightly right-skewed,
+    centred around 50-55 ug/m3.
+- **Row 2** (soiling-specific indicators):
+  - Left: `cycle_deviation_pct`. Distribution of within-cycle performance
+    decline. Most values cluster near 0% (start of cycles); a right tail
+    shows how far performance degrades before the next reset.
+  - Centre: `domain_soiling_daily`. Distribution of the DSPI daily
+    accumulation rate. This is a physics-based metric, so its shape reflects
+    environmental conditions rather than plant performance.
+  - Right: `t1_perf_loss_rate_14d_pct_per_day`. The 14-day rolling rate of
+    change in loss proxy. Values near zero mean stable performance; positive
+    values mean performance is worsening (active soiling).
 
 ### s4_pvlib_vs_observed.png
 
-**Layout**: Two panels.
+**Layout**: 2x2 grid comparing two physics-based soiling estimates against the
+observed loss proxy.
 
-- Left: Scatter of pvlib Kimber loss (%) vs observed loss proxy (%).
-- Right: Time-series with observed proxy on the left y-axis and pvlib
-  Kimber loss on the right y-axis.
+- **Top row (pvlib Kimber)**:
+  - Left: Scatter of pvlib Kimber loss (%) vs observed loss proxy (%).
+  - Right: Time-series with observed proxy on the left y-axis and pvlib
+    Kimber loss on the right y-axis.
+- **Bottom row (Domain Soiling Index / DSPI)**:
+  - Left: Scatter of DSPI cumulative value vs observed loss proxy (%).
+  - Right: Time-series with observed proxy on the left y-axis and DSPI on
+    the right y-axis.
 
 **What to look for**:
 
 - pvlib predicts small losses (~0-8%) while the observed proxy ranges 0-80%.
   The magnitude mismatch is expected because pvlib models pure soiling while
   the proxy is all-cause.
-- Look for **relative pattern agreement**: do both lines rise and fall at the
-  same times, even if at different scales? That confirms pvlib captures the
-  soiling component.
-- Weak correlation (r ~ -0.14) is expected. pvlib will be more useful as a
-  feature inside an ML model than as a standalone predictor.
+- The DSPI uses a different scale (cumulative environmental pressure units).
+  Compare the **shape** of rises and falls, not absolute values.
+- Look for **relative pattern agreement** in both rows: do the physics lines
+  rise and fall at the same times as the observed proxy, even at different
+  scales? That confirms the physics model captures the soiling component.
+- Compare the `r` values in the scatter titles to see which physics estimate
+  tracks observed loss better. Both are expected to be weak because the
+  observed proxy includes non-soiling losses (clouds, equipment).
+- pvlib uses a generic deposition model; DSPI is calibrated for this site's
+  environmental profile. The comparison reveals whether site-specific tuning
+  improves tracking.
 
 ### s4_sensor_dirt_check.png
 
