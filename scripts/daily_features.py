@@ -943,6 +943,212 @@ def compute_soiling_features(daily: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Domain Soiling Pressure Index (DSPI)
+# ---------------------------------------------------------------------------
+
+# Default domain-knowledge weights for the DSPI formula.
+# PM2.5 weighted 2x vs PM10: finer particles fill interparticle gaps more
+# completely and resist wind/rain removal (Appels et al.; confirmed by our
+# data where cumul_pm25 outperforms cumul_pm10 in predicting cycle_deviation).
+_DSPI_DEFAULTS = {
+    "w_pm25": 2.0,
+    "w_pm10": 1.0,
+    "rh_scale": 1.0,    # divisor for humidity normalisation
+    "dew_scale": 0.5,   # dew proximity amplification
+    "cement_boost": 0.3, # light-rain cementation boost
+}
+
+# Rain threshold (mm) below which precipitation cements dust rather than
+# cleaning it.  Literature range 0.5-10 mm (Mejia et al.).  1 mm is
+# conservative and aligns with our existing rain_day definition.
+_DSPI_CLEANING_RAIN_MM = 1.0
+
+
+def _build_dspi_daily(
+    pm25: np.ndarray,
+    pm10: np.ndarray,
+    rh: np.ndarray,
+    delta_t: np.ndarray,
+    light_rain: np.ndarray,
+    params: dict,
+) -> np.ndarray:
+    """Compute the daily soiling pressure rate from the DSPI formula."""
+    base = params["w_pm25"] * pm25 + params["w_pm10"] * pm10
+    hum_factor = 1.0 + np.clip((rh - 40.0) / (40.0 * params["rh_scale"]), 0, 1)
+    dew_factor = 1.0 + params["dew_scale"] * np.clip(1.0 - delta_t / 10.0, 0, 1)
+    cement_factor = 1.0 + params["cement_boost"] * light_rain
+    return base * hum_factor * dew_factor * cement_factor
+
+
+def _optimise_dspi_weights(
+    pm25: np.ndarray,
+    pm10: np.ndarray,
+    rh: np.ndarray,
+    delta_t: np.ndarray,
+    light_rain: np.ndarray,
+    precip: np.ndarray,
+    cloud: np.ndarray,
+    temp: np.ndarray,
+) -> dict:
+    """Find DSPI weights that maximise the desired correlation profile.
+
+    Objective: maximise positive correlation with PM10/PM25, negative
+    correlation with rainfall, while penalising correlation with
+    cloud opacity and temperature (non-soiling factors).
+    Uses no plant performance data — only environmental features.
+    """
+    from scipy.optimize import minimize
+
+    mask = np.isfinite(pm25) & np.isfinite(pm10) & np.isfinite(rh)
+    mask &= np.isfinite(delta_t) & np.isfinite(precip)
+    mask &= np.isfinite(cloud) & np.isfinite(temp)
+    if mask.sum() < 30:
+        return dict(_DSPI_DEFAULTS)
+
+    pm25_m, pm10_m = pm25[mask], pm10[mask]
+    rh_m, dt_m, lr_m = rh[mask], delta_t[mask], light_rain[mask]
+    precip_m, cloud_m, temp_m = precip[mask], cloud[mask], temp[mask]
+
+    def _corr(a: np.ndarray, b: np.ndarray) -> float:
+        if a.std() < 1e-12 or b.std() < 1e-12:
+            return 0.0
+        return float(np.corrcoef(a, b)[0, 1])
+
+    def objective(x):
+        p = {
+            "w_pm25": x[0], "w_pm10": x[1], "rh_scale": x[2],
+            "dew_scale": x[3], "cement_boost": x[4],
+        }
+        idx = _build_dspi_daily(pm25_m, pm10_m, rh_m, dt_m, lr_m, p)
+        r_pm25 = _corr(idx, pm25_m)
+        r_pm10 = _corr(idx, pm10_m)
+        r_rain = _corr(idx, precip_m)
+        r_cloud = _corr(idx, cloud_m)
+        r_temp = _corr(idx, temp_m)
+
+        reward = r_pm25 + r_pm10 - r_rain
+        penalty = r_cloud ** 2 + r_temp ** 2
+        return -(reward - 5.0 * penalty)
+
+    bounds = [
+        (0.5, 5.0),   # w_pm25
+        (0.1, 3.0),   # w_pm10
+        (0.5, 2.0),   # rh_scale
+        (0.1, 1.0),   # dew_scale
+        (0.05, 0.5),  # cement_boost
+    ]
+    x0 = [
+        _DSPI_DEFAULTS["w_pm25"],
+        _DSPI_DEFAULTS["w_pm10"],
+        _DSPI_DEFAULTS["rh_scale"],
+        _DSPI_DEFAULTS["dew_scale"],
+        _DSPI_DEFAULTS["cement_boost"],
+    ]
+    try:
+        res = minimize(objective, x0=x0, bounds=bounds, method="L-BFGS-B")
+        if res.success:
+            return {
+                "w_pm25": float(res.x[0]),
+                "w_pm10": float(res.x[1]),
+                "rh_scale": float(res.x[2]),
+                "dew_scale": float(res.x[3]),
+                "cement_boost": float(res.x[4]),
+            }
+    except Exception:
+        pass
+    return dict(_DSPI_DEFAULTS)
+
+
+def compute_domain_soiling_index(daily: pd.DataFrame) -> pd.DataFrame:
+    """Add the Domain Soiling Pressure Index (DSPI) to the daily table.
+
+    The DSPI is a physics-grounded soiling estimate built entirely from
+    environmental satellite data (PM2.5, PM10, humidity, dewpoint,
+    precipitation).  No plant performance data is used, so the index
+    is free of data-leakage concerns.
+
+    **Formula** (literature-grounded, nonlinear):
+
+        daily_rate = (w_pm25 * PM2.5 + w_pm10 * PM10)
+                     * humidity_factor * dew_factor * cementation_factor
+
+    - *Base deposition*: PM2.5 weighted 2x vs PM10 (Appels et al.)
+    - *Humidity adhesion*: factor 1.0→2.0 over 40→80% RH (Said et al.)
+    - *Dew proximity*: amplification when air-dewpoint spread < 10 C
+    - *Light-rain cementation*: rain 0–1 mm wets dust without cleaning
+      (Mejia et al.)
+    - *Cumulative index*: accumulates daily_rate, resets on cleaning rain
+      (>= 1 mm) or known cleaning campaigns.
+
+    Relative weights are calibrated via constrained optimisation that
+    maximises positive correlation with PM and negative with rainfall
+    while penalising correlation with non-soiling factors (cloud opacity,
+    temperature).  Falls back to literature defaults if optimisation fails.
+
+    Produces columns: ``domain_soiling_daily``, ``domain_soiling_index``.
+    Modifies *daily* in place and returns it.
+    """
+    required = {"pm25_mean", "pm10_mean", "humidity_mean", "precipitation_total_mm"}
+    if not required.issubset(daily.columns):
+        return daily
+
+    pm25 = daily["pm25_mean"].fillna(0).values.astype(float)
+    pm10 = daily["pm10_mean"].fillna(0).values.astype(float)
+    rh = daily["humidity_mean"].fillna(60).values.astype(float)
+
+    if "air_temp_mean" in daily.columns and "dewpoint_mean" in daily.columns:
+        delta_t = (
+            daily["air_temp_mean"].fillna(25) - daily["dewpoint_mean"].fillna(20)
+        ).values.astype(float)
+    else:
+        delta_t = np.full(len(daily), 10.0)
+
+    precip = daily["precipitation_total_mm"].fillna(0).values.astype(float)
+    light_rain = ((precip > 0) & (precip < _DSPI_CLEANING_RAIN_MM)).astype(float)
+
+    cloud = (
+        daily["cloud_opacity_mean"].fillna(0).values.astype(float)
+        if "cloud_opacity_mean" in daily.columns
+        else np.zeros(len(daily))
+    )
+    temp = (
+        daily["air_temp_mean"].fillna(25).values.astype(float)
+        if "air_temp_mean" in daily.columns
+        else np.full(len(daily), 25.0)
+    )
+
+    # --- Optimise weights from data distributions ---
+    opt_weights = _optimise_dspi_weights(
+        pm25, pm10, rh, delta_t, light_rain, precip, cloud, temp,
+    )
+    print(f"  DSPI weights (optimised): {opt_weights}")
+
+    daily_rate = _build_dspi_daily(pm25, pm10, rh, delta_t, light_rain, opt_weights)
+    daily["domain_soiling_daily"] = daily_rate
+
+    # --- Cumulative index with resets ---
+    cleaning_rain = precip >= _DSPI_CLEANING_RAIN_MM
+    day_dt = pd.to_datetime(daily["day"], errors="coerce")
+    is_clean = pd.Series(False, index=daily.index)
+    for start_s, end_s in CLEANING_CAMPAIGN_DATES:
+        s, e = pd.Timestamp(start_s), pd.Timestamp(end_s)
+        is_clean = is_clean | ((day_dt >= s) & (day_dt <= e))
+
+    is_reset = cleaning_rain | is_clean.values
+    acc = []
+    total = 0.0
+    for rate, reset in zip(daily_rate, is_reset):
+        if reset:
+            total = float(rate)
+        else:
+            total += float(rate)
+        acc.append(total)
+    daily["domain_soiling_index"] = acc
+
+    return daily
+
+
+# ---------------------------------------------------------------------------
 # pvlib soiling integration
 # ---------------------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 """EDA: Three go/no-go signal tests for soiling loss prediction.
 
-Produces ~14 plots in artifacts/eda/plots/ and a quantitative verdict
+Produces ~19 plots in artifacts/eda/plots/ and a quantitative verdict
 report in artifacts/eda/eda_signal_report.md.
 
 Usage:
@@ -352,29 +352,37 @@ def test_signal_2_dust_correlation(
     fig.tight_layout()
     _save(fig, plots_dir / "s2_pm10_scatter_panels.png")
 
-    # S2-B  cumulative PM10 vs cycle deviation --------------------------------
-    fig, ax = plt.subplots(figsize=(7, 5))
-    pair = hq[["cumulative_pm10_since_rain", "cycle_deviation_pct"]].dropna()
-    ax.scatter(
-        pair["cumulative_pm10_since_rain"], pair["cycle_deviation_pct"],
-        s=12, alpha=0.5, color=C_ACCENT,
-    )
-    if len(pair) > 3:
-        r_cum, p_cum = stats.pearsonr(*pair.values.T)
-        slope, intercept, *_ = stats.linregress(*pair.values.T)
-        x_fit = np.linspace(pair.iloc[:, 0].min(), pair.iloc[:, 0].max(), 50)
-        ax.plot(x_fit, intercept + slope * x_fit, color=C_DRY, lw=1.5)
-        ax.set_title(
-            f"Signal 2-B: Cumul. PM10 vs cycle deviation (r={r_cum:.3f}, p={p_cum:.3f})",
-            fontsize=10,
-        )
-    else:
-        r_cum = p_cum = np.nan
-        ax.set_title("Signal 2-B: Cumul. PM10 vs cycle deviation")
-    ax.set_xlabel("Cumulative PM10 since rain (µg/m³·days)")
-    ax.set_ylabel("Cycle deviation (%)")
+    # S2-B  top predictors vs cycle deviation (3-panel) -------------------------
+    top_predictors = [
+        ("days_since_last_rain", "Days since last rain"),
+        ("cumulative_pm25_since_rain", "Cumul. PM2.5 since rain (µg/m³·days)"),
+        ("cumulative_pm10_since_rain", "Cumul. PM10 since rain (µg/m³·days)"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+    top_raw_corrs: Dict[str, float] = {}
+    for ax, (col, xlabel) in zip(axes, top_predictors):
+        pair = hq[[col, "cycle_deviation_pct"]].dropna()
+        ax.scatter(pair[col], pair["cycle_deviation_pct"],
+                   s=12, alpha=0.5, color=C_ACCENT)
+        if len(pair) > 3:
+            r_val, p_val = stats.pearsonr(*pair.values.T)
+            slope, intercept, *_ = stats.linregress(*pair.values.T)
+            x_fit = np.linspace(pair.iloc[:, 0].min(), pair.iloc[:, 0].max(), 50)
+            ax.plot(x_fit, intercept + slope * x_fit, color=C_DRY, lw=1.5)
+            ax.set_title(f"r={r_val:+.3f}, p={p_val:.3f}", fontsize=9)
+            top_raw_corrs[col] = r_val
+        else:
+            top_raw_corrs[col] = np.nan
+            ax.set_title("insufficient data", fontsize=9)
+        ax.set_xlabel(xlabel, fontsize=8)
+        ax.set_ylabel("Cycle deviation (%)", fontsize=8)
+    fig.suptitle("Signal 2-B: Top predictors vs cycle deviation", fontsize=11)
     fig.tight_layout()
-    _save(fig, plots_dir / "s2_cumulative_pm10_vs_deviation.png")
+    _save(fig, plots_dir / "s2_top_predictors_vs_deviation.png")
+
+    r_cum = top_raw_corrs.get("cumulative_pm10_since_rain", np.nan)
+    r_cum25 = top_raw_corrs.get("cumulative_pm25_since_rain", np.nan)
+    r_days = top_raw_corrs.get("days_since_last_rain", np.nan)
 
     # S2-C  feature correlation heatmap --------------------------------------
     env_cols = [
@@ -382,8 +390,10 @@ def test_signal_2_dust_correlation(
         "wind_speed_10m_mean", "air_temp_mean", "cloud_opacity_mean",
     ]
     eng_cols = [
-        "days_since_last_rain", "cumulative_pm10_since_rain",
+        "days_since_last_rain", "days_since_significant_rain",
+        "cumulative_pm10_since_rain", "cumulative_pm25_since_rain",
         "humidity_x_pm10", "wind_speed_10m_rolling_7d",
+        "domain_soiling_daily", "domain_soiling_index",
     ]
     pvlib_cols = ["pvlib_soiling_ratio_hsu", "pvlib_soiling_loss_kimber"]
     target_cols = [loss_col, loss_rate_col, "cycle_deviation_pct"]
@@ -456,16 +466,26 @@ def test_signal_2_dust_correlation(
         "r_all_pm10_vs_rate": r_all,
         "r_clear_pm10_vs_rate": r_clear,
         "r_cumpm10_vs_deviation": r_cum if np.isfinite(r_cum) else None,
+        "r_cumpm25_vs_deviation": r_cum25 if np.isfinite(r_cum25) else None,
+        "r_days_since_rain_vs_deviation": r_days if np.isfinite(r_days) else None,
         "best_partial_r": best_partial_r,
         "partial_results": partial_results,
         "r_within_cycle": r_within,
         "p_within_cycle": p_within,
         "n_cycles": len(within_pair),
     }
+    strongest_raw = max(
+        [("days_since_last_rain", r_days),
+         ("cumulative_pm25_since_rain", r_cum25),
+         ("cumulative_pm10_since_rain", r_cum)],
+        key=lambda t: t[1] if np.isfinite(t[1]) else -999,
+    )
     summary = (
+        f"Strongest raw predictor of cycle deviation: {strongest_raw[0]} "
+        f"(r={strongest_raw[1]:+.3f}). "
         f"Best partial correlation (deconfounded) = {best_partial_r:+.3f}. "
-        f"Within-cycle PM10-rate r = {r_within:+.3f} (n={len(within_pair)} cycles). "
-        f"Cumul. PM10 vs deviation r = {r_cum:+.3f}."
+        f"Within-cycle PM10-rate r = {r_within:+.3f} "
+        f"(n={len(within_pair)} cycles)."
     )
     log.info("Signal 2 verdict: %s — %s", verdict.upper(), summary)
     return SignalResult("Signal 2: PM/Dust", verdict, summary, details)
@@ -834,6 +854,105 @@ def run_supporting_analyses(
     results["n_total"] = len(df)
     results["n_hq_zero_flag"] = hq_zero
     results["date_range"] = f"{df['day_dt'].min().date()} to {df['day_dt'].max().date()}"
+
+    # S5-A  Domain Soiling Pressure Index time-series -------------------------
+    if "domain_soiling_index" in df.columns:
+        fig, ax1 = plt.subplots(figsize=(14, 5))
+        ax1.plot(
+            df["day_dt"], df["domain_soiling_index"],
+            lw=1.0, color=C_DRY, alpha=0.85, label="Domain soiling index",
+        )
+        ax1.set_ylabel("Domain soiling index (cumul. units)", color=C_DRY)
+        ax1.tick_params(axis="y", labelcolor=C_DRY)
+        _add_rain_cleaning_overlays(ax1, df)
+
+        if "cycle_deviation_pct" in df.columns:
+            ax2 = ax1.twinx()
+            ax2.plot(
+                df["day_dt"], df["cycle_deviation_pct"],
+                lw=0.8, color=C_T1, alpha=0.65, label="Cycle deviation (%)",
+            )
+            ax2.set_ylabel("Cycle deviation (%)", color=C_T1)
+            ax2.tick_params(axis="y", labelcolor=C_T1)
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left")
+        else:
+            ax1.legend(fontsize=7)
+
+        ax1.set_title(
+            "S5-A: Domain Soiling Pressure Index vs observed cycle deviation",
+            fontsize=10,
+        )
+        ax1.xaxis.set_major_locator(mdates.MonthLocator())
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
+        fig.tight_layout()
+        _save(fig, plots_dir / "s5_domain_soiling_index.png")
+
+        # Correlation with cycle_deviation
+        pair_dspi = df[["domain_soiling_index", "cycle_deviation_pct"]].dropna()
+        if len(pair_dspi) > 3:
+            r_dspi_cd, _ = stats.pearsonr(*pair_dspi.values.T)
+        else:
+            r_dspi_cd = np.nan
+        results["dspi_vs_cycle_deviation_r"] = r_dspi_cd
+
+    # S5-B  DSPI correlation profile ------------------------------------------
+    if "domain_soiling_index" in df.columns:
+        profile_cols = [
+            ("pm25_mean", "PM2.5"),
+            ("pm10_mean", "PM10"),
+            ("cumulative_pm25_since_rain", "Cumul. PM2.5"),
+            ("cumulative_pm10_since_rain", "Cumul. PM10"),
+            ("days_since_last_rain", "Days since rain"),
+            ("humidity_mean", "Humidity"),
+            ("humidity_x_pm10", "Humidity x PM10"),
+            ("dewpoint_mean", "Dewpoint"),
+            ("precipitation_total_mm", "Precipitation"),
+            ("wind_speed_10m_mean", "Wind speed"),
+            ("cloud_opacity_mean", "Cloud opacity"),
+            ("air_temp_mean", "Air temperature"),
+            ("t1_performance_loss_pct_proxy", "Loss proxy"),
+            ("t1_perf_loss_rate_14d_pct_per_day", "Loss rate"),
+            ("cycle_deviation_pct", "Cycle deviation"),
+        ]
+        corr_vals, corr_labels = [], []
+        for col, label in profile_cols:
+            if col in hq.columns:
+                pair = hq[["domain_soiling_index", col]].dropna()
+                if len(pair) > 3:
+                    r_val, _ = stats.pearsonr(*pair.values.T)
+                else:
+                    r_val = np.nan
+                corr_vals.append(r_val)
+                corr_labels.append(label)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        colours = [
+            "#2ecc71" if v > 0.1 else "#e74c3c" if v < -0.1 else "#95a5a6"
+            for v in corr_vals
+        ]
+        y_pos = range(len(corr_labels))
+        ax.barh(y_pos, corr_vals, color=colours, alpha=0.8, edgecolor="white", lw=0.5)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(corr_labels, fontsize=8)
+        ax.set_xlabel("Pearson r with domain_soiling_index")
+        ax.axvline(0, color="black", lw=0.5)
+        for i, v in enumerate(corr_vals):
+            if np.isfinite(v):
+                ax.text(
+                    v + (0.02 if v >= 0 else -0.02), i, f"{v:+.3f}",
+                    va="center", ha="left" if v >= 0 else "right", fontsize=7,
+                )
+        ax.set_title(
+            "S5-B: Domain Soiling Index — correlation profile (HQ days)",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        _save(fig, plots_dir / "s5_dspi_correlation_profile.png")
+
+        results["dspi_corr_profile"] = dict(zip(corr_labels, corr_vals))
+
     return results
 
 
@@ -939,15 +1058,26 @@ def write_report(
         "",
         "## Signal 2: PM/Dust Correlation",
         "",
+        "Correlations below are between environmental features (independent",
+        "variables from Solcast satellite data) and observed plant performance",
+        "metrics (dependent variables derived from actual energy generation).",
+        "A positive correlation with `cycle_deviation_pct` means the",
+        "environmental factor predicts within-cycle performance decline.",
+        "",
         f"**Verdict: {s2.verdict.upper()}**",
         "",
         s2.summary,
+        "",
+        "### Top raw predictors of cycle deviation",
+        "",
+        f"- `days_since_last_rain`: r = {_fmt_r(s2.details.get('r_days_since_rain_vs_deviation'))}",
+        f"- `cumulative_pm25_since_rain`: r = {_fmt_r(s2.details.get('r_cumpm25_vs_deviation'))}",
+        f"- `cumulative_pm10_since_rain`: r = {_fmt_r(s2.details.get('r_cumpm10_vs_deviation'))}",
         "",
         "### Raw correlations (confounded by cloud opacity)",
         "",
         f"- PM10 vs loss rate (all HQ): r = {_fmt_r(s2.details.get('r_all_pm10_vs_rate'))}",
         f"- PM10 vs loss rate (clear-sky): r = {_fmt_r(s2.details.get('r_clear_pm10_vs_rate'))}",
-        f"- Cumul. PM10 vs cycle deviation: r = {_fmt_r(s2.details.get('r_cumpm10_vs_deviation'))}",
         "",
         "### Partial correlations (controlling for cloud opacity + temperature)",
         "",
@@ -958,7 +1088,7 @@ def write_report(
         f"- PM10 vs cycle soiling rate: r = {_fmt_r(s2.details.get('r_within_cycle'))} "
         f"(n = {s2.details.get('n_cycles', 0)} cycles)",
         "",
-        "Plots: `s2_pm10_scatter_panels.png`, `s2_cumulative_pm10_vs_deviation.png`,",
+        "Plots: `s2_pm10_scatter_panels.png`, `s2_top_predictors_vs_deviation.png`,",
         "`s2_feature_heatmap.png`",
         "",
         "---",
@@ -1002,6 +1132,38 @@ def write_report(
         "  (Feb-Apr) is consistent with faster soiling accumulation during low-rainfall",
         "  periods.",
         "",
+        "### Domain Soiling Pressure Index (DSPI)",
+        "",
+        "A physics-based soiling estimate built entirely from environmental satellite",
+        "data (PM2.5, PM10, humidity, dewpoint, precipitation). No plant performance",
+        "data is used, making it leakage-free. Formula:",
+        "",
+        "    daily_rate = (w_pm25 * PM2.5 + w_pm10 * PM10)",
+        "                * humidity_factor * dew_factor * cementation_factor",
+        "",
+        "Component weights were calibrated via constrained optimisation to maximise",
+        "positive correlation with PM and negative with rainfall while penalising",
+        "correlation with cloud opacity and temperature.",
+        "",
+        f"- Correlation with cycle deviation: r = {_fmt_r(supporting.get('dspi_vs_cycle_deviation_r'))}",
+        "",
+    ]
+
+    dspi_profile = supporting.get("dspi_corr_profile", {})
+    if dspi_profile:
+        lines.extend([
+            "**Correlation profile (HQ days):**",
+            "",
+            "| Feature | r |",
+            "|---|---|",
+        ])
+        for feat_label, r_val in dspi_profile.items():
+            lines.append(f"| {feat_label} | {_fmt_r(r_val)} |")
+        lines.append("")
+
+    lines.extend([
+        "Plots: `s5_domain_soiling_index.png`, `s5_dspi_correlation_profile.png`",
+        "",
         "---",
         "",
         "## Overall Go/No-Go Verdict",
@@ -1015,7 +1177,7 @@ def write_report(
         f"| 3. Rain recovery | {s3.verdict.upper()} |",
         "",
         overall_text,
-    ]
+    ])
     report = "\n".join(lines) + "\n"
 
     out_path.write_text(report, encoding="utf-8")

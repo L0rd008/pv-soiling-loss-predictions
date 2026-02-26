@@ -36,6 +36,7 @@ from daily_features import (
     compute_common_overlap,
     compute_cross_block_correlation,
     compute_cycle_deviation,
+    compute_domain_soiling_index,
     compute_performance_features,
     compute_performance_ratio,
     compute_pvlib_soiling_ratio,
@@ -281,6 +282,9 @@ def build_daily_model_table(
 
     # --- Soiling feature engineering ---
     daily = compute_soiling_features(daily)
+
+    # --- Domain Soiling Pressure Index ---
+    daily = compute_domain_soiling_index(daily)
 
     # --- Cycle-aware deviation ---
     daily = compute_cycle_deviation(daily)
