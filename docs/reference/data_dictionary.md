@@ -214,6 +214,23 @@ Combined PR:
 |---|---|---|---|
 | `subset_pr` | float64 | dimensionless | Combined PR for all tiered inverters |
 
+Physical new-source PR fields:
+
+| Column | Type | Unit | Description |
+|---|---|---|---|
+| `runtime_h` | float64 | hours | Runtime used in irradiation denominator (CSV primary, Solcast fallback) |
+| `runtime_source` | string | category | Runtime source: `runtime_csv` or `solcast_daylight` |
+| `irradiation_kwh_m2` | float64 | kWh/m² | Daily irradiation = `plant_avg_irradiance_wm2 * runtime_h / 1000` |
+| `subset_capacity_kw` | float64 | kW | Capacity basis for subset PR (`330 * aligned inverter count`) |
+| `plant_capacity_kw` | float64 | kW | Capacity basis for plant PR (`330 * plant inverter count`) |
+| `subset_pr_physical_raw` | float64 | dimensionless | `subset_daily_gen_kwh / (subset_capacity_kw * irradiation_kwh_m2)` |
+| `subset_pr_physical_outlier` | bool | — | True when subset physical PR is outside `[0,1]` |
+| `subset_pr_physical_interp` | float64 | dimensionless | Outlier-masked/interpolated subset PR trend |
+| `plant_pr_physical_raw` | float64 | dimensionless | `daily_generation_kwh / (plant_capacity_kw * irradiation_kwh_m2)` |
+| `plant_pr_physical_outlier` | bool | — | True when plant physical PR is outside `[0,1]` |
+| `gen_irr_ratio` | float64 | dimensionless | Backward-compatible alias of `subset_pr_physical_raw` |
+| `gen_irr_ratio_smoothed` | float64 | dimensionless | 7-day median of `gen_irr_ratio` |
+
 ## Soiling Features (in `daily_model_input.csv`)
 
 Computed by `compute_soiling_features()`. Require Solcast columns to be present.
@@ -272,7 +289,7 @@ Computed by `compute_cycle_deviation()`. Cycles are delimited by rain or cleanin
 
 ## Audit Outputs (`artifacts/audit/`)
 
-`scripts/data_quality_audit.py` produces:
+`scripts/4_audit/audit.py` produces:
 - `dataset_profile.csv`
 - `interval_distribution.csv`
 - `missingness_by_column.csv`
@@ -282,7 +299,7 @@ Computed by `compute_cycle_deviation()`. Cycles are delimited by rain or cleanin
 
 ## EDA Outputs (`artifacts/eda/`)
 
-`scripts/eda_soiling_signals.py` produces a quantitative signal report and
+`scripts/5_eda/soiling_signals.py` produces a quantitative signal report and
 22 diagnostic plots. See `docs/eda_output_interpretation.md` for how to read
 each output.
 

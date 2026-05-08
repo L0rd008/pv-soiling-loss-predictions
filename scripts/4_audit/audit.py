@@ -3,13 +3,12 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-# Ensure sibling modules (daily_features) are importable from any cwd
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import pandas as pd
 
-from daily_features import (
+from core.daily_features import (
     MIN_IRRADIANCE_FOR_BASELINE,
     MAX_NORMALIZED_OUTPUT,
     INVERTER_INTERVAL_S,

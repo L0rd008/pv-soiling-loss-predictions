@@ -11,7 +11,7 @@ Reads the existing inverter CSV and the candidate B1 CSV, then produces:
 
 Usage::
 
-    python scripts/split_inverter_tiers.py
+    python scripts/2_organize/split_tiers.py
 """
 
 from pathlib import Path

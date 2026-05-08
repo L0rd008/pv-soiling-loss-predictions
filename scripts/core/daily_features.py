@@ -23,7 +23,7 @@ EXPECTED_IRR_RECORDS_PER_DAY = 96    # 24h * 4
 # Minimum daily irradiance sum (W·s/m²) for a day to qualify for baseline.
 # Days below this are treated as sensor outage and excluded from the rolling
 # clean baseline.  50 000 W·s/m² ≈ ~14 W/m² average over 1 hour.
-MIN_IRRADIANCE_FOR_BASELINE = 50_000.0
+MIN_IRRADIANCE_FOR_BASELINE = 5_000.0
 
 # Minimum peak-hour Solcast GTI sum (J/m²) for baseline qualification.
 # 1 MJ/m² ≈ 69 W/m² average over 4 h  → excludes only heavily overcast days.
@@ -54,9 +54,8 @@ PEAK_IRR_RECORDS_PER_DAY = _PEAK_HOURS * (3600 // IRRADIANCE_INTERVAL_S) # 4h * 
 
 # Cleaning campaign windows (start_date, end_date) used by pvlib Kimber model
 CLEANING_CAMPAIGN_DATES = [
-    ("2025-09-20", "2025-09-30"),
-    ("2025-10-20", "2025-10-30"),
-    ("2025-11-20", "2025-11-30"),
+    ("2025-03-16", "2025-03-18"),
+    ("2025-09-08", "2025-09-09"),
 ]
 
 SIGNIFICANT_RAIN_MM = 5.0  # Precipitation threshold for "significant rain" [mm]
@@ -393,10 +392,17 @@ def aggregate_inverter_daily(
         inv_daily["inverter_records"] / expected_records
     ).clip(upper=1.0)
 
+    # Upscale energy to account for missing network dropouts (missing timestamps)
+    # Cap upscale factor at 1.5x (max 33% missing data imputation)
+    upscale_factor = (expected_records / inv_daily["inverter_records"]).clip(lower=1.0, upper=1.5)
+    inv_daily["subset_energy_j"] *= upscale_factor
+
     return inv_daily, power_cols
 
 
-def aggregate_block_daily(inv: pd.DataFrame, power_cols: List[str]) -> pd.DataFrame:
+def aggregate_block_daily(
+    inv: pd.DataFrame, power_cols: List[str], expected_records: int = EXPECTED_INV_RECORDS_PER_DAY
+) -> pd.DataFrame:
     """Build per-block (B1 vs B2) daily energy aggregates.
 
     Returns a DataFrame with columns: day, b1_energy_j, b2_energy_j,
@@ -421,9 +427,15 @@ def aggregate_block_daily(inv: pd.DataFrame, power_cols: List[str]) -> pd.DataFr
             b2_energy_j=("b2_energy_j_step", "sum"),
             b1_data_availability=("b1_power_w", lambda s: s.notna().mean()),
             b2_data_availability=("b2_power_w", lambda s: s.notna().mean()),
+            inverter_records=("b1_power_w", "size"),
         )
         .reset_index()
     )
+    
+    upscale_factor = (expected_records / block_daily["inverter_records"]).clip(lower=1.0, upper=1.5)
+    block_daily["b1_energy_j"] *= upscale_factor
+    block_daily["b2_energy_j"] *= upscale_factor
+    block_daily = block_daily.drop(columns=["inverter_records"])
     block_daily["block_mismatch_ratio"] = (
         block_daily["b1_energy_j"] / block_daily["b2_energy_j"].replace(0, np.nan)
     )
@@ -434,7 +446,7 @@ def aggregate_block_daily(inv: pd.DataFrame, power_cols: List[str]) -> pd.DataFr
 
 
 def aggregate_tier_daily(
-    inv: pd.DataFrame, power_cols: List[str],
+    inv: pd.DataFrame, power_cols: List[str], expected_records: int = EXPECTED_INV_RECORDS_PER_DAY
 ) -> pd.DataFrame:
     """Build separate Tier-1 (B2) and Tier-2 (B1) daily energy aggregates.
 
@@ -467,9 +479,15 @@ def aggregate_tier_daily(
                 f"{tier_label}_energy_j": (col_energy_step, "sum"),
                 f"{tier_label}_power_w_p95": (col_power, lambda s: s.quantile(0.95)),
                 f"{tier_label}_data_availability": (col_completeness, "mean"),
+                f"{tier_label}_records": (col_power, "size"),
             })
             .reset_index()
         )
+        
+        upscale_factor = (expected_records / tier_daily[f"{tier_label}_records"]).clip(lower=1.0, upper=1.5)
+        tier_daily[f"{tier_label}_energy_j"] *= upscale_factor
+        tier_daily = tier_daily.drop(columns=[f"{tier_label}_records"])
+        
         result_frames.append(tier_daily)
 
     if not result_frames:
@@ -638,6 +656,104 @@ def aggregate_per_inverter_daily(
 
 
 # ---------------------------------------------------------------------------
+# Power at reference irradiance
+# ---------------------------------------------------------------------------
+
+_REF_IRR_TOLERANCE = 0.15  # +/- 15 % of dataset median irradiance
+_REF_IRR_MIN_ROWS = 2      # need at least 2 matched rows per day
+
+
+def compute_power_at_reference_irradiance(
+    inv: pd.DataFrame,
+    irr: pd.DataFrame,
+) -> pd.DataFrame:
+    """Extract active power at the dataset's median irradiance level.
+
+    For each day, finds sub-daily intervals where on-site tilted irradiance
+    is within +/-15 % of the dataset-wide median, then averages the total
+    active power at those timestamps.  Symmetric generation curves (morning
+    and afternoon hitting the same irradiance) are averaged naturally.
+
+    Parameters
+    ----------
+    inv : pd.DataFrame
+        Peak-hour-filtered sub-daily inverter data with ``Date``, ``day``,
+        ``subset_power_w`` columns and per-tier columns if available.
+    irr : pd.DataFrame
+        Peak-hour-filtered sub-daily irradiance data with ``Date``, ``day``
+        columns and a tilted irradiance column.
+
+    Returns
+    -------
+    pd.DataFrame
+        Daily table with ``day``, ``power_at_ref_irradiance_w``,
+        ``ref_irradiance_wm2`` (the median used), ``ref_irr_match_count``
+        (how many sub-daily rows matched per day), and per-tier variants
+        if available.
+    """
+    inv_c = inv[["Date", "day", "subset_power_w"]].dropna(subset=["subset_power_w"]).copy()
+
+    for tier in ("t1", "t2"):
+        col = f"{tier}_power_w"
+        if col in inv.columns:
+            inv_c[col] = inv[col]
+
+    irr_cols = [c for c in irr.columns if "Tilted" in c and "Irradiance" in c]
+    if not irr_cols:
+        irr_cols = [c for c in irr.columns if "Irradiance" in c]
+    if not irr_cols:
+        return pd.DataFrame(columns=["day"])
+    irr_col = irr_cols[0]
+
+    irr_c = irr[["Date", "day", irr_col]].dropna(subset=[irr_col]).copy()
+    irr_c.rename(columns={irr_col: "_irr"}, inplace=True)
+
+    inv_c = inv_c.sort_values("Date")
+    irr_c = irr_c.sort_values("Date")
+    merged = pd.merge_asof(
+        inv_c, irr_c[["Date", "_irr"]],
+        on="Date",
+        tolerance=pd.Timedelta("7.5min"),
+        direction="nearest",
+    )
+    merged = merged.dropna(subset=["_irr"])
+
+    if merged.empty:
+        return pd.DataFrame(columns=["day"])
+
+    ref_irr = float(merged["_irr"].median())
+    if ref_irr <= 0:
+        return pd.DataFrame(columns=["day"])
+
+    lo = ref_irr * (1.0 - _REF_IRR_TOLERANCE)
+    hi = ref_irr * (1.0 + _REF_IRR_TOLERANCE)
+    matched = merged[(merged["_irr"] >= lo) & (merged["_irr"] <= hi)].copy()
+
+    agg_spec = {
+        "power_at_ref_irradiance_w": ("subset_power_w", "mean"),
+        "ref_irr_match_count": ("subset_power_w", "size"),
+    }
+    for tier in ("t1", "t2"):
+        col = f"{tier}_power_w"
+        if col in matched.columns:
+            agg_spec[f"{tier}_power_at_ref_irradiance_w"] = (col, "mean")
+
+    daily = (
+        matched.groupby("day")
+        .agg(**agg_spec)
+        .reset_index()
+    )
+
+    daily.loc[
+        daily["ref_irr_match_count"] < _REF_IRR_MIN_ROWS,
+        [c for c in daily.columns if c.endswith("_irradiance_w")],
+    ] = np.nan
+    daily["ref_irradiance_wm2"] = ref_irr
+
+    return daily
+
+
+# ---------------------------------------------------------------------------
 # Performance loss features
 # ---------------------------------------------------------------------------
 
@@ -740,6 +856,81 @@ def compute_performance_features(
     return daily
 
 
+def compute_loss_proxy_from_ratio(
+    daily: pd.DataFrame,
+    ratio_col: str = "gen_irr_ratio",
+    prefix: str = "new",
+    baseline_window: int = 30,
+    baseline_quantile: float = 0.95,
+) -> pd.DataFrame:
+    """Build rolling baseline, loss proxy, and loss rate from a pre-computed ratio.
+
+    This mirrors :func:`compute_performance_features` but operates on an
+    already-normalised performance ratio (e.g. ``gen_irr_ratio``) so that
+    callers do not need energy and irradiance columns with compatible units.
+
+    Parameters
+    ----------
+    daily : pd.DataFrame
+        Must contain the column named by *ratio_col*.
+    ratio_col : str
+        Pre-computed daily performance ratio (higher = better performance).
+    prefix : str
+        All output columns are prefixed, e.g. ``"new_performance_loss_pct_proxy"``.
+    baseline_window : int
+        Rolling window size (days) for the clean baseline.
+    baseline_quantile : float
+        Quantile used for the rolling clean baseline.
+    """
+    def _col(name: str) -> str:
+        return f"{prefix}_{name}"
+
+    if ratio_col not in daily.columns or daily[ratio_col].isna().all():
+        return daily
+
+    ratio = daily[ratio_col].copy()
+
+    daily[_col("normalized_output")] = ratio
+
+    daily[_col("normalized_output_14d_median")] = (
+        ratio.rolling(14, min_periods=5).median()
+    )
+
+    # Clear-day mask: keep top 60 % of valid ratio days.  The threshold is
+    # lower than the old pipeline's 60th-percentile irradiance guard because
+    # the new-source ratio has ~70 % daily coverage (vs near-100 % for Solcast).
+    # Using the 40th percentile + cloud guard retains enough qualifying days
+    # for baseline construction.
+    clear_threshold = ratio.quantile(0.40)
+    clear_day_mask = ratio >= clear_threshold
+    if "cloud_opacity_mean" in daily.columns:
+        clear_day_mask = clear_day_mask & (
+            daily["cloud_opacity_mean"] <= CLOUD_OPACITY_BASELINE_MAX
+        )
+
+    baseline_src = ratio.where(clear_day_mask)
+    daily[_col("rolling_clean_baseline")] = (
+        baseline_src
+        .rolling(baseline_window, min_periods=4)
+        .quantile(baseline_quantile)
+        .ffill()
+    )
+
+    daily[_col("performance_loss_pct_proxy")] = (
+        100.0 * (1.0 - ratio / daily[_col("rolling_clean_baseline")])
+    ).clip(lower=0, upper=100)
+
+    daily[_col("perf_loss_rate_14d_pct_per_day")] = (
+        (
+            daily[_col("performance_loss_pct_proxy")]
+            - daily[_col("performance_loss_pct_proxy")].shift(14)
+        )
+        / 14.0
+    )
+
+    return daily
+
+
 def compute_cross_block_correlation(daily: pd.DataFrame) -> pd.DataFrame:
     """Add cross-block correlation between Tier-1 and Tier-2 performance loss.
 
@@ -830,21 +1021,25 @@ def compute_quality_flags(daily: pd.DataFrame) -> pd.DataFrame:
             daily["irradiance_coverage_ratio"] < 0.30
         )
 
-    # Block mismatch: B1/B2 ratio deviates >15% from rolling median
+    # Block mismatch: B1/B2 ratio deviates >25% from rolling median
     if "block_mismatch_ratio" in daily.columns and "block_mismatch_ratio_rolling_median" in daily.columns:
         daily["flag_block_mismatch"] = (
             (daily["block_mismatch_ratio"] - daily["block_mismatch_ratio_rolling_median"]).abs()
-            > 0.15 * daily["block_mismatch_ratio_rolling_median"].abs()
+            > 0.25 * daily["block_mismatch_ratio_rolling_median"].abs()
         ) & daily["block_mismatch_ratio"].notna()
     else:
         daily["flag_block_mismatch"] = False
 
-    # Low output under high irradiance — use Tier-1 normalized output
-    norm_col = "t1_normalized_output" if "t1_normalized_output" in daily.columns else "normalized_output"
-    norm_14d_col = (
-        "t1_normalized_output_14d_median" if "t1_normalized_output_14d_median" in daily.columns
-        else "normalized_output_14d_median"
-    )
+    # Low output under high irradiance — use best available normalized output
+    if "new_normalized_output" in daily.columns:
+        norm_col = "new_normalized_output"
+        norm_14d_col = "new_normalized_output_14d_median"
+    elif "t1_normalized_output" in daily.columns:
+        norm_col = "t1_normalized_output"
+        norm_14d_col = "t1_normalized_output_14d_median"
+    else:
+        norm_col = "normalized_output"
+        norm_14d_col = "normalized_output_14d_median"
     _qf_irr_col = (
         "solcast_gti_peak_sum"
         if "solcast_gti_peak_sum" in daily.columns
@@ -869,6 +1064,25 @@ def compute_quality_flags(daily: pd.DataFrame) -> pd.DataFrame:
     daily["flag_zero_output"] = (
         (daily[norm_col] <= 0) | daily[norm_col].isna()
     ) & (daily[_qf_irr_col] > _qf_irr_thr)
+
+    # Missing new telemetry daily gen on sunny days
+    if "subset_daily_gen_kwh" in daily.columns:
+        daily["flag_zero_subset_gen"] = (
+            (daily["subset_daily_gen_kwh"] <= 0) | daily["subset_daily_gen_kwh"].isna()
+        ) & (daily[_qf_irr_col] > _qf_irr_thr)
+        
+    # Sensor recalibration / drift detection via Solcast/ground ratio step changes
+    if "solcast_gti_peak_sum" in daily.columns and "irradiance_tilted_sum" in daily.columns:
+        valid_irr = (
+            (daily["solcast_gti_peak_sum"] > _qf_irr_thr) 
+            & (daily["irradiance_tilted_sum"] > MIN_IRRADIANCE_FOR_BASELINE)
+        )
+        ratio = daily["solcast_gti_peak_sum"] / daily["irradiance_tilted_sum"].replace(0, np.nan)
+        ratio_smooth = ratio.where(valid_irr).rolling(14, min_periods=5).median()
+        ratio_shift = ratio_smooth.shift(14)
+        daily["flag_sensor_recalibrated"] = (
+            (ratio_smooth - ratio_shift).abs() / ratio_shift.replace(0, np.nan) > 0.25
+        ) & ratio_smooth.notna() & ratio_shift.notna()
 
     return daily
 
@@ -905,13 +1119,19 @@ def compute_transfer_readiness(daily: pd.DataFrame) -> pd.DataFrame:
     # Penalty: block mismatch
     score -= np.where(daily.get("flag_block_mismatch", False), 10.0, 0.0)
 
-    # Penalty: missing performance loss proxy (prefer Tier-1 proxy)
-    loss_col = (
-        "t1_performance_loss_pct_proxy" if "t1_performance_loss_pct_proxy" in daily.columns
-        else "performance_loss_pct_proxy"
-    )
+    # Penalty: missing performance loss proxy
+    if "new_performance_loss_pct_proxy" in daily.columns:
+        loss_col = "new_performance_loss_pct_proxy"
+    elif "t1_performance_loss_pct_proxy" in daily.columns:
+        loss_col = "t1_performance_loss_pct_proxy"
+    else:
+        loss_col = "performance_loss_pct_proxy"
     if loss_col in daily.columns:
         score -= np.where(daily[loss_col].isna(), 15.0, 0.0)
+
+    # Penalty: zero daily generation via alternate sensor on a sunny day
+    if "flag_zero_subset_gen" in daily.columns:
+        score -= np.where(daily["flag_zero_subset_gen"], 50.0, 0.0)
 
     daily["transfer_quality_score"] = np.clip(score, 0.0, 100.0)
 
@@ -948,11 +1168,12 @@ def flag_clear_sky_analyzable(daily: pd.DataFrame) -> pd.DataFrame:
 
     Modifies *daily* in place and returns it.
     """
-    norm_col = (
-        "t1_normalized_output"
-        if "t1_normalized_output" in daily.columns
-        else "normalized_output"
-    )
+    if "new_normalized_output" in daily.columns:
+        norm_col = "new_normalized_output"
+    elif "t1_normalized_output" in daily.columns:
+        norm_col = "t1_normalized_output"
+    else:
+        norm_col = "normalized_output"
 
     mask = pd.Series(True, index=daily.index)
 
@@ -1436,35 +1657,48 @@ def compute_cycle_deviation(
     daily: pd.DataFrame,
     energy_col: str = "subset_energy_j",
     irr_sum_col: str = "irradiance_tilted_sum",
+    precomputed_x_col: Optional[str] = None,
+    prefix: Optional[str] = None,
 ) -> pd.DataFrame:
     """Add cycle-aware soiling deviation feature.
 
-    X = energy / (irr_sum / tracked_time)  -- normalised by average
-    irradiance rate, more robust than raw irr_sum when data coverage varies.
+    When *precomputed_x_col* is ``None`` (default), X is computed as
+    ``energy / (irr_sum / tracked_time)``.  When a column name is provided,
+    that column is used directly as the soiling index X (useful for
+    pre-normalised ratios like ``gen_irr_ratio``).
 
     Cycles are delimited by rain events or cleaning campaigns.  Within each
     cycle the max(X) represents "just cleaned" performance; the deviation
     from that max tracks soiling accumulation.
 
-    Produces ``cycle_id``, ``soiling_index_x``, ``cycle_max_x``, and
-    ``cycle_deviation_pct`` columns.
+    Parameters
+    ----------
+    precomputed_x_col : str or None
+        If set, use this column as the soiling index X instead of computing it.
+    prefix : str or None
+        If set, output columns become ``{prefix}_cycle_id``, etc.
 
     Modifies *daily* in place and returns it.
     """
-    if energy_col not in daily.columns or irr_sum_col not in daily.columns:
-        return daily
+    def _col(name: str) -> str:
+        return f"{prefix}_{name}" if prefix else name
 
-    # Tracked time in seconds (from inverter record count)
-    if "inverter_records" in daily.columns:
-        tracked_time = daily["inverter_records"] * INVERTER_INTERVAL_S
+    if precomputed_x_col is not None:
+        if precomputed_x_col not in daily.columns or daily[precomputed_x_col].isna().all():
+            return daily
+        soiling_x = daily[precomputed_x_col].copy()
     else:
-        tracked_time = pd.Series(
-            (PEAK_HOUR_END - PEAK_HOUR_START) * 3600.0, index=daily.index,
-        )
-
-    mean_irr_rate = daily[irr_sum_col] / tracked_time
-    mean_irr_rate = mean_irr_rate.replace(0, np.nan)
-    soiling_x = daily[energy_col] / mean_irr_rate
+        if energy_col not in daily.columns or irr_sum_col not in daily.columns:
+            return daily
+        if "inverter_records" in daily.columns:
+            tracked_time = daily["inverter_records"] * INVERTER_INTERVAL_S
+        else:
+            tracked_time = pd.Series(
+                (PEAK_HOUR_END - PEAK_HOUR_START) * 3600.0, index=daily.index,
+            )
+        mean_irr_rate = daily[irr_sum_col] / tracked_time
+        mean_irr_rate = mean_irr_rate.replace(0, np.nan)
+        soiling_x = daily[energy_col] / mean_irr_rate
 
     # Determine cycle boundaries
     day_dt = pd.to_datetime(daily["day"], errors="coerce")
@@ -1474,7 +1708,6 @@ def compute_cycle_deviation(
     else:
         is_rain = pd.Series(False, index=daily.index)
 
-    # Mark cleaning campaign days
     is_clean = pd.Series(False, index=daily.index)
     for start_s, end_s in CLEANING_CAMPAIGN_DATES:
         start = pd.Timestamp(start_s)
@@ -1484,15 +1717,15 @@ def compute_cycle_deviation(
     is_reset = is_rain | is_clean
     cycle_id = is_reset.cumsum()
 
-    daily["cycle_id"] = cycle_id.values
-    daily["soiling_index_x"] = soiling_x.values
+    x_col = _col("soiling_index_x")
+    daily[_col("cycle_id")] = cycle_id.values
+    daily[x_col] = soiling_x.values
 
-    # Max X within each cycle (forward-looking max from cycle start)
-    cycle_max = daily.groupby("cycle_id")["soiling_index_x"].transform("max")
-    daily["cycle_max_x"] = cycle_max
+    cycle_max = daily.groupby(_col("cycle_id"))[x_col].transform("max")
+    daily[_col("cycle_max_x")] = cycle_max
 
-    daily["cycle_deviation_pct"] = (
-        100.0 * (1.0 - daily["soiling_index_x"] / daily["cycle_max_x"])
+    daily[_col("cycle_deviation_pct")] = (
+        100.0 * (1.0 - daily[x_col] / daily[_col("cycle_max_x")])
     ).clip(lower=0, upper=100)
 
     return daily

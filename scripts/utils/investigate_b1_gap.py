@@ -4,7 +4,7 @@ Diagnostic script to analyze per-inverter and per-block data availability,
 identify shared missing windows between B1 and B2-04, and report findings.
 
 Usage:
-    python scripts/investigate_b1_gap.py --data-dir data
+    python scripts/utils/investigate_b1_gap.py --data-dir data
 """
 
 import argparse

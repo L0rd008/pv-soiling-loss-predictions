@@ -11,7 +11,7 @@ and written as empty (NaN downstream).
 
 Usage::
 
-    python scripts/power_generation_data_fetch.py
+    python scripts/1_fetch/power_generation.py
 
 Environment variables (see ``.env.example``):
     TB_URL, TB_TOKEN, TB_PLNT_ID, TB_GEN_KEYS
@@ -22,8 +22,11 @@ Environment variables (see ``.env.example``):
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
 
-from tb_client import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.tb_client import (
     auth_headers,
     get_output_dir,
     get_request_timeout,

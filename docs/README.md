@@ -5,11 +5,11 @@ ThingsBoard fetch through EDA signal analysis.
 
 Detailed stage guides:
 
-1. `docs/pipeline_replication/01_fetching.md`
-2. `docs/pipeline_replication/02_cleaning_preprocessing.md`
-3. `docs/pipeline_replication/03_audit_validation.md`
-4. `docs/pipeline_replication/04_eda_guide_daily_model_eda.md`
-5. `docs/pipeline_replication/05_eda_soiling_signals.md`
+1. `docs/pipeline/01_fetching.md`
+2. `docs/pipeline/02_cleaning_preprocessing.md`
+3. `docs/pipeline/03_audit_validation.md`
+4. `docs/pipeline/04_eda_features.md`
+5. `docs/pipeline/05_eda_soiling_signals.md`
 
 ## Why This Is Split
 
@@ -28,24 +28,26 @@ aligned with the scripts.
 ## Quick Run
 
 ```bash
-python scripts/inverter_data_fetch.py
-python scripts/irradiance_data_fetch.py
-python scripts/power_generation_data_fetch.py
-python scripts/split_inverter_tiers.py
-python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocessed
-python scripts/data_quality_audit.py --data-dir data --out-dir artifacts/audit
-python scripts/eda_soiling_signals.py
+python scripts/1_fetch/inverter_power.py
+python scripts/1_fetch/irradiance.py
+python scripts/1_fetch/power_generation.py
+python scripts/1_fetch/inverter_daily_gen.py
+python scripts/1_fetch/plant_avg_irradiance.py
+python scripts/2_organize/split_tiers.py
+python scripts/3_preprocess/preprocess.py --data-dir data --out-dir artifacts/preprocessed
+python scripts/4_audit/audit.py --data-dir data --out-dir artifacts/audit
+python scripts/5_eda/soiling_signals.py
 ```
 
 Optional:
 
 ```bash
-python scripts/b1_availability_comparison.py
+python scripts/utils/b1_availability_comparison.py
 ```
 
 ## Reproducibility Notes
 
-- `scripts/data_preprocess.py` and `scripts/data_quality_audit.py` prefer `data/inverters_tiered_primary_10min.csv` if it exists; otherwise they fall back to `data/inverters_2025_to_current_10min_avg_si.csv`.
+- `scripts/3_preprocess/preprocess.py` and `scripts/4_audit/audit.py` prefer `data/inverters_tiered_primary_10min.csv` if it exists; otherwise they fall back to `data/inverters_2025_to_current_10min_avg_si.csv`.
 - Solcast inputs are optional and must be located at:
   - `data/soiling_2025_to_current_10min_none_std.csv`
   - `data/irradiance_2025_to_current_10min_none_std.csv`

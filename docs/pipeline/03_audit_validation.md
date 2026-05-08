@@ -5,7 +5,7 @@ This guide reproduces the independent audit pipeline and validation artifacts.
 ## Run Audit
 
 ```bash
-python scripts/data_quality_audit.py --data-dir data --out-dir artifacts/audit
+python scripts/4_audit/audit.py --data-dir data --out-dir artifacts/audit
 ```
 
 ## Input Resolution Rules
@@ -45,7 +45,7 @@ Report and plots:
 ## Optional Availability Investigation
 
 ```bash
-python scripts/b1_availability_comparison.py
+python scripts/utils/b1_availability_comparison.py
 ```
 
 Outputs:
@@ -60,8 +60,8 @@ Use this for inverter-level telemetry reliability ranking and B1 vs B2 gap diagn
 Run both pipelines and compare key metrics:
 
 ```powershell
-python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocessed
-python scripts/data_quality_audit.py --data-dir data --out-dir artifacts/audit
+python scripts/3_preprocess/preprocess.py --data-dir data --out-dir artifacts/preprocessed
+python scripts/4_audit/audit.py --data-dir data --out-dir artifacts/audit
 ```
 
 Recommended checks:

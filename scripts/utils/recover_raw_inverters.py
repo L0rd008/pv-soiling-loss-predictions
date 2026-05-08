@@ -7,7 +7,7 @@ tiered primary file separately.
 
 Usage::
 
-    python scripts/recover_raw_inverters.py
+    python scripts/utils/recover_raw_inverters.py
 """
 
 from pathlib import Path
@@ -65,7 +65,7 @@ def main() -> None:
     print(f"\n  RECOVERED: {PRIMARY}")
     print(f"    {len(raw)} rows, {len(raw.columns)} cols")
     print(f"    Inverters: {', '.join(ORIGINAL_8)}")
-    print(f"\n  Now run: python scripts/split_inverter_tiers.py")
+    print(f"\n  Now run: python scripts/2_organize/split_tiers.py")
 
 
 if __name__ == "__main__":

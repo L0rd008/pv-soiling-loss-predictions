@@ -1,7 +1,7 @@
 # EDA Output Interpretation Guide
 
 How to read each plot and section of the soiling signal report produced by
-`scripts/eda_soiling_signals.py`.
+`scripts/5_eda/soiling_signals.py`.
 
 Generated outputs live in `artifacts/eda/`. The report is
 `eda_signal_report.md`; plots are in `artifacts/eda/plots/`.
@@ -820,3 +820,278 @@ opacity, temperature, and irradiance as inputs can learn to "see through" the
 weather contamination that the simple statistical tests in the EDA could not
 resolve. The fact that Signals 1 and 2 are strong provides sufficient
 confidence that soiling signal exists in the data.
+
+---
+
+## Data Quality Diagnostics (DQ)
+
+### Why this section exists
+
+The Signal plots (S1-S3) answer "is there a soiling signal?" The Data
+Quality (DQ) plots answer a different question: "can we trust the underlying
+data?" They cross-validate data sources, verify unit consistency, compare
+old and new telemetry pipelines, and confirm that derived features behave as
+expected before any modelling begins.
+
+DQ plots are numbered DQ1 through DQ6. Some were split into separate
+time-series and non-time-series files to avoid compressing year-long x-axes
+into unreadable panels.
+
+### dq1_irradiance_vs_generation_timeseries.png
+
+**Layout**: Single full-width panel with dual y-axes.
+
+- Left y-axis (teal): on-site irradiance sensor sum (10 AM-2 PM window).
+- Right y-axis (amber): T1 inverter generation in kWh (same window).
+- Faint blue vertical lines mark rain events; orange bands mark cleaning
+  campaigns.
+
+**What to look for**:
+
+- Both traces should broadly co-vary: sunny days produce both high
+  irradiance and high generation. Systematic divergence (e.g., generation
+  dropping while irradiance stays high) may indicate soiling, equipment
+  faults, or sensor problems.
+- Sharp generation drops on otherwise clear days are red flags for inverter
+  trips or data dropouts.
+- Look for the traces to reconverge after rain/cleaning events, which
+  supports the soiling hypothesis.
+- Because this uses the on-site sensor sum (which has known unit ambiguity),
+  the absolute irradiance values are less important than the shape and
+  co-movement with generation.
+
+### dq1_irradiance_vs_generation.png
+
+**Layout**: Three panels side by side.
+
+- Panel 1 (left): Scatter of on-site irradiance vs T1 generation, coloured
+  by month. A Pearson r value is shown in the title.
+- Panel 2 (centre): Scatter of Solcast peak-hour GTI (kWh/m^2, 10-14h) vs
+  T1 generation, coloured by month. A small annotation shows the correlation
+  against full-plant generation if available.
+- Panel 3 (right): Monthly boxplot of normalised output
+  (energy/irradiance). The CV of monthly medians is shown as a text
+  annotation.
+
+**What to look for**:
+
+- **Panel 1**: Low r is expected for the T1 subset (3 inverters) because
+  individual inverter variability (clipping, faults) breaks the simple
+  linear relationship. A cloud of points with no clear trend is typical.
+- **Panel 2**: A higher r here (especially for full-plant generation)
+  confirms that Solcast satellite irradiance is a reliable reference. If
+  the full-plant annotation shows r > 0.4, the data pipeline is trustworthy.
+- **Panel 3**: Monthly medians should be roughly stable across the year if
+  the normalisation is working. A high CV (> 20%) suggests seasonal
+  confounders or sensor issues that the normalisation does not remove. Dry
+  months (Jan-Mar, Jun-Sep) may show slightly lower medians from soiling.
+
+### dq2_daily_gen_validation_timeseries.png
+
+**Layout**: Two stacked time-series panels (full width).
+
+- Top panel: old-source generation (active power integral, kWh, purple)
+  overlaid with new-source generation (daily_generated_electricity, kWh,
+  teal). A vertical dashed line marks the start of new-source data.
+- Bottom panel: plant average irradiance (avg_solar_radiation, teal)
+  overlaid with Solcast peak GTI mean (purple). Same new-source start
+  annotation.
+
+**What to look for**:
+
+- **Top panel**: Where both traces overlap (post new-source start), they
+  should track each other in shape even if absolute magnitudes differ. The
+  old source covers 10 AM-2 PM only; the new source is full-day. Large
+  divergences on specific days suggest data quality issues in one source.
+- **Bottom panel**: The plant irradiance and Solcast lines should correlate
+  well. If the plant sensor consistently reads higher or lower than Solcast,
+  that is a scaling offset — acceptable as long as the trends match. If
+  they diverge for a stretch, the on-site sensor may have been obstructed
+  or miscalibrated.
+- The grey region before the vertical dashed line shows where only old data
+  exists. This is expected — the new telemetry was not available before
+  Apr 2025.
+
+### dq2_daily_gen_validation.png
+
+**Layout**: Two scatter panels side by side.
+
+- Left panel: Old generation (active power integral, kWh) vs new generation
+  (daily_generated_electricity, kWh). A 1:1 reference line is shown.
+- Right panel: Solcast peak GTI mean (W/m^2) vs plant average irradiance
+  (W/m^2).
+
+**What to look for**:
+
+- **Left panel**: Points should cluster around the 1:1 line if both sources
+  measure the same underlying quantity. Systematic offset (points
+  consistently above or below the line) indicates a scaling difference
+  between peak-hour and full-day aggregation. Extreme outliers suggest
+  data quality issues on specific days.
+- **Right panel**: A tight cluster along a diagonal confirms irradiance
+  consistency. r > 0.6 is a positive sign. Scatter that widens at high
+  irradiance values may indicate cloud variability on those days.
+- Low old-vs-new generation r is expected when the two sources use different
+  time windows (peak-hour vs full-day).
+
+### dq3_gen_irr_ratio_timeseries.png
+
+**Layout**: Two stacked time-series panels (full width).
+
+- Top panel: Generation/irradiance ratio (daily as faint dots, 7-day median
+  as a bold dark blue line), overlaid with scaled generation (orange) and
+  scaled irradiance (yellow) for context. A black dashed horizontal line
+  marks the overall median ratio. Rain and cleaning overlays are shown.
+  A vertical dashed line marks new-source data start.
+- Bottom panel: Smoothed gen/irr ratio (dark blue) overlaid with inverted
+  loss proxy (purple, right y-axis). The Pearson r between them is shown
+  in the title.
+
+**What to look for**:
+
+- **Top panel**: The 7-day median line should show a sawtooth pattern —
+  gradual decline during dry spells (soiling accumulation) with sharp
+  recoveries at rain events or cleaning campaigns. If the line is flat or
+  random, the ratio may be too noisy to isolate soiling.
+- **Top panel**: The scaled generation and irradiance traces provide
+  context. If generation drops but irradiance stays high, that is genuine
+  performance loss. If both drop together, that is a cloudy period.
+- **Bottom panel**: The smoothed ratio and inverted loss proxy should
+  broadly co-move. Positive r confirms agreement between the two
+  independent measures of performance. Weak r is expected given the
+  different time windows and the Jan-Mar data gap.
+
+### dq3_gen_irr_ratio.png
+
+**Layout**: Single boxplot panel.
+
+- Monthly boxplots of the generation/irradiance ratio. Each box shows the
+  distribution for one calendar month.
+
+**What to look for**:
+
+- Months in the dry season (Jan-Mar, Jun-Sep) should show slightly lower
+  medians and tighter distributions if soiling accumulates during those
+  periods.
+- Wet-season months (Apr-May, Oct-Dec) should show higher medians if rain
+  cleaning is effective.
+- Large boxes with many outliers suggest high day-to-day variability, which
+  is partly weather-driven.
+- If all months have similar medians, soiling may not produce enough
+  seasonal variation to distinguish from noise — but intra-month variation
+  (the sawtooth) can still be present.
+
+### dq4_power_at_ref_irradiance.png
+
+**Layout**: Two panels side by side.
+
+- Left panel: Time-series of active power at the dataset's median
+  irradiance level. Rain and cleaning overlays are shown. This feature
+  controls for irradiance variation — on days with the same irradiance
+  level, power differences come from soiling, temperature, or equipment.
+- Right panel: Horizontal bar chart of Pearson r between
+  `power_at_ref_irradiance_w` and various soiling features on HQ days.
+
+**What to look for**:
+
+- **Left panel**: A sawtooth pattern (gradual decline between rain events,
+  recovery after rain/cleaning) confirms soiling drives the power decrease.
+  If the line is flat or shows random fluctuation, the feature may not
+  isolate soiling well.
+- **Right panel**: Strong negative correlation with `t1_performance_loss_pct_proxy`
+  is expected and confirms the feature captures degradation. Negative
+  correlations with `cumulative_pm25_since_rain` and `days_since_last_rain`
+  indicate that soiling (not equipment) drives the decline. Positive
+  correlations with humidity-related features may reflect the tropical
+  paradox (humidity both promotes dust adhesion and cleans via dew).
+- Caveat: This feature uses active power from the T1 inverter subset, which
+  is subject to inverter-level variability (trips, clipping). Per-inverter
+  faults can create artificial drops unrelated to soiling.
+
+### dq5_old_vs_new_timeseries.png
+
+**Layout**: Two stacked time-series panels (full width).
+
+- Top panel: Performance loss proxy (%) from the old source (teal, T1
+  active-power-based) overlaid with the new source (amber,
+  daily_gen/avg_irr-based). A vertical dashed line marks new-source data
+  start.
+- Bottom panel: Cycle deviation (%) from the old source (teal) overlaid
+  with the new source (amber). Same new-source start annotation.
+
+**What to look for**:
+
+- **Top panel**: In the overlap region (post new-source start), the two
+  traces should show similar trends — both rising during dry spells and
+  dropping after rain. The magnitudes may differ because the two pipelines
+  use different time windows and baselines. Persistent divergence suggests
+  one source has a calibration or data quality issue.
+- **Bottom panel**: Cycle deviation should also broadly agree in the
+  overlap region. If the new source shows larger deviations, the full-day
+  aggregation may be more sensitive to soiling. If it shows smaller
+  deviations, the peak-hour window may better isolate soiling.
+- The old source covers the entire date range; the new source starts in
+  Apr 2025. The Jan-Mar gap misses the peak dry season, so the new source
+  cannot be evaluated under the harshest soiling conditions.
+
+### dq5_old_vs_new_comparison.png
+
+**Layout**: Two panels side by side.
+
+- Left panel: Scatter of old loss proxy (%) vs new loss proxy (%). A 1:1
+  reference line is shown. The Pearson r and sample size are in the title.
+- Right panel: Grouped bar chart comparing soiling feature correlations
+  against the old vs new loss proxy. Features: DSPI, cumulative PM2.5,
+  cumulative PM10, days dry, humidity x PM10.
+
+**What to look for**:
+
+- **Left panel**: Points near the 1:1 line mean both pipelines agree on
+  the severity of each day's loss. Scatter away from the line means the
+  two pipelines disagree — expected given different time windows. A low
+  or negative r is not alarming; it reflects the structural differences
+  between the two pipelines rather than data quality problems.
+- **Right panel**: Compare the bar heights for each feature. If the new
+  source shows stronger correlations (taller bars) with environmental
+  soiling drivers, it may be a better target for modelling. If the old
+  source is consistently stronger, the peak-hour window may isolate
+  soiling better. Mixed results (some features stronger in old, some in
+  new) are common and suggest complementary value from both pipelines.
+- Caveat: The new source covers fewer months (missing Jan-Mar), so its
+  correlations may be biased toward wetter months with less soiling.
+
+### dq6_performance_index.png
+
+**Layout**: Three panels using a grid layout.
+
+- Top panel (spans full width): Time-series of the new-source performance
+  index (gen_irr_ratio / rolling_clean_baseline, clipped at 1.5). Rain
+  and cleaning overlays are shown. A horizontal dashed line at 1.0 marks
+  clean-panel performance. A vertical dashed line marks new-source data
+  start.
+- Bottom-left panel: Histogram of the performance index distribution, with
+  vertical lines for the median and the 0.9 threshold.
+- Bottom-right panel: Scatter plots of the performance index vs each of
+  five soiling features (DSPI, cumulative PM2.5/PM10, days dry,
+  humidity x PM10), with Pearson r values annotated.
+
+**What to look for**:
+
+- **Top panel**: The index should hover near 1.0 after rain/cleaning events
+  and decline during dry spells. Values consistently below 0.8 indicate
+  heavy persistent losses. If the line is flat near a low value, the
+  rolling baseline may not be resetting properly, or equipment issues
+  dominate.
+- **Bottom-left panel**: The distribution should peak near 0.6-0.9 for a
+  soiled plant with occasional cleaning. A bimodal distribution (one peak
+  near 1.0, another lower) would suggest distinct clean/dirty states — a
+  strong soiling signal.
+- **Bottom-right panel**: Negative correlations with cumulative PM and
+  days-since-rain features confirm that soiling pressure reduces the
+  performance index. Weak correlations (|r| < 0.1) may indicate the
+  index is dominated by non-soiling factors or that the data gap
+  removes the strongest soiling period from the analysis.
+- If the median is well below 1.0 (e.g., 0.6-0.7), this indicates
+  substantial and persistent performance loss. If the mean is much lower
+  than the median, extreme outlier days (equipment faults, severe soiling)
+  are pulling the distribution down.

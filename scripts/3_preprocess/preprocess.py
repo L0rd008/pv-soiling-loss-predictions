@@ -4,21 +4,21 @@ This script standardizes raw exports, applies domain sanity checks, builds
 daily modeling features, and writes preprocessing outputs.
 
 Usage:
-    python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocessed
+    python scripts/3_preprocess/preprocess.py --data-dir data --out-dir artifacts/preprocessed
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-# Ensure sibling modules (daily_features) are importable from any cwd
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import pandas as pd
 
-from daily_features import (
+from core.daily_features import (
     INVERTER_INTERVAL_S,
     MIN_IRRADIANCE_FOR_BASELINE,
     MAX_NORMALIZED_OUTPUT,
@@ -37,12 +37,14 @@ from daily_features import (
     compute_cross_block_correlation,
     compute_cycle_deviation,
     compute_domain_soiling_index,
+    compute_loss_proxy_from_ratio,
     compute_performance_features,
     compute_performance_ratio,
     compute_pvlib_soiling_ratio,
     compute_quality_flags,
     compute_soiling_features,
     compute_temperature_corrected_pr,
+    compute_power_at_reference_irradiance,
     compute_transfer_readiness,
     flag_clear_sky_analyzable,
     detect_irradiance_cols,
@@ -53,6 +55,8 @@ from daily_features import (
 MAX_POWER_W = 300_000.0
 MAX_CURRENT_A = 250.0
 MAX_GENERATION_J = 360_000_000_000.0
+DEFAULT_RUNTIME_CSV = Path("data/time_series_chart_time_series_chart.csv")
+DEFAULT_DAILY_GEN_WARN_KWH = 1_000.0
 
 
 def load_numeric_csv(path: Path) -> pd.DataFrame:
@@ -183,13 +187,293 @@ def clean_generation(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, 
     return df, daily, stats
 
 
-def build_daily_model_table(
+# ---------------------------------------------------------------------------
+# New telemetry: per-inverter daily generated electricity
+# ---------------------------------------------------------------------------
+
+MAX_DAILY_GEN_KWH_WARN = 1_000.0  # warning threshold used for clip diagnostics
+KWH_TO_JOULES = 3_600_000.0
+
+
+def clean_inverter_daily_gen(
+    path: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
+    """Load per-inverter daily_generated_electricity CSV and build a daily table.
+
+    The CSV contains cumulative kWh readings sampled at ~1-min intervals that
+    reset at midnight. Daily value selection is robust to reset-edge and spike
+    behavior using ``last``, ``max``, and ``p99``.
+
+    Returns ``(daily_df, audit_df, stats)`` where ``daily_df`` has columns
+    ``{inv_label}_daily_gen_j`` for each inverter plus a ``day`` column.
+    """
+    df = load_numeric_csv(path)
+    df, duplicates_removed = dedupe_by_timestamp(df)
+
+    kwh_cols = [c for c in df.columns if "kWh" in c]
+    if not kwh_cols:
+        raise ValueError(f"No kWh columns found in {path}")
+
+    neg_count = 0
+    above_warn_count = 0
+    for col in kwh_cols:
+        neg_mask = df[col] < 0
+        neg_count += int(neg_mask.sum())
+        df[col] = df[col].mask(neg_mask)
+        above_warn_count += int((df[col] > MAX_DAILY_GEN_KWH_WARN).sum())
+
+    df["day"] = df["Date"].dt.floor("D")
+
+    daily = pd.DataFrame({"day": sorted(df["day"].dropna().unique())})
+    audit_frames: List[pd.DataFrame] = []
+    converted_cols: List[str] = []
+
+    for col in kwh_cols:
+        parts = col.split()
+        inv_name = parts[0] if parts else col
+        label = inv_name.lower().replace("-", "_")
+        group = (
+            df.sort_values("Date")
+            .groupby("day")
+            .agg(
+                last_kwh=(col, "last"),
+                max_kwh=(col, "max"),
+                p99_kwh=(col, lambda s: s.dropna().quantile(0.99) if s.notna().any() else np.nan),
+                records=(col, "size"),
+                non_null_records=(col, "count"),
+                last_valid_dt=("Date", lambda s: s[df.loc[s.index, col].notna()].max() if df.loc[s.index, col].notna().any() else pd.NaT),
+            )
+            .reset_index()
+        )
+        spike_mask = (
+            group["max_kwh"].notna()
+            & group["p99_kwh"].notna()
+            & (group["p99_kwh"] > 0)
+            & (group["max_kwh"] > 1.25 * group["p99_kwh"])
+        )
+        selected_kwh = group["max_kwh"].copy()
+        selected_kwh[spike_mask] = group.loc[spike_mask, "p99_kwh"]
+        group["selected_kwh"] = selected_kwh
+
+        q1 = float(group["selected_kwh"].quantile(0.25))
+        q3 = float(group["selected_kwh"].quantile(0.75))
+        iqr = q3 - q1
+        upper_fence = q3 + 3.0 * iqr
+        outlier_mask = group["selected_kwh"] > upper_fence if np.isfinite(upper_fence) else pd.Series(False, index=group.index)
+        group["selected_kwh_clean"] = group["selected_kwh"].mask(outlier_mask)
+        group["selection_method"] = np.where(spike_mask, "p99_guard", "max")
+        group["outlier_flag"] = outlier_mask.fillna(False)
+        group["inverter"] = inv_name
+
+        out_col_j = f"{label}_daily_gen_j"
+        converted_cols.append(out_col_j)
+        tmp = group[["day", "selected_kwh_clean"]].copy()
+        tmp[out_col_j] = tmp["selected_kwh_clean"] * KWH_TO_JOULES
+        tmp = tmp.drop(columns=["selected_kwh_clean"])
+        daily = daily.merge(tmp, on="day", how="left")
+
+        audit_frames.append(
+            group[
+                [
+                    "day",
+                    "inverter",
+                    "records",
+                    "non_null_records",
+                    "last_valid_dt",
+                    "last_kwh",
+                    "max_kwh",
+                    "p99_kwh",
+                    "selected_kwh",
+                    "selection_method",
+                    "outlier_flag",
+                    "selected_kwh_clean",
+                ]
+            ]
+        )
+
+    audit_df = pd.concat(audit_frames, ignore_index=True) if audit_frames else pd.DataFrame()
+
+    stats = {
+        "rows": float(len(df)),
+        "duplicates_removed": float(duplicates_removed),
+        "daily_gen_negative_to_nan": float(neg_count),
+        "daily_gen_above_warn_count": float(above_warn_count),
+        "daily_gen_above_warn_pct": float(100.0 * above_warn_count / max(len(df) * max(len(kwh_cols), 1), 1)),
+        "inverter_count": float(len(kwh_cols)),
+        "daily_rows": float(len(daily)),
+        "daily_outlier_rows_removed": float(audit_df["outlier_flag"].sum()) if not audit_df.empty else 0.0,
+    }
+    return daily, audit_df, stats
+
+
+# ---------------------------------------------------------------------------
+# New telemetry: plant-level average solar radiation
+# ---------------------------------------------------------------------------
+
+MAX_AVG_IRRADIANCE_WM2 = 1_500.0
+
+
+def clean_plant_avg_irradiance(
+    path: Path,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """Load plant avg_solar_radiation CSV and build a daily table.
+
+    The CSV contains a running daily-average W/m^2 value that resets at
+    midnight.  The last reading per day equals the true daily average.
+
+    Returns ``(daily_df, stats)`` where ``daily_df`` has columns
+    ``day`` and ``plant_avg_irradiance_wm2``.
+    """
+    df = load_numeric_csv(path)
+    df, duplicates_removed = dedupe_by_timestamp(df)
+
+    value_cols = [c for c in df.columns if c not in ("Timestamp", "Date")]
+    if len(value_cols) != 1:
+        raise ValueError(
+            f"Expected one irradiance column, found: {value_cols}"
+        )
+    irr_col = value_cols[0]
+
+    invalid = (df[irr_col] < 0) | (df[irr_col] > MAX_AVG_IRRADIANCE_WM2)
+    invalid_count = int(invalid.sum())
+    df[irr_col] = df[irr_col].mask(invalid)
+
+    df["day"] = df["Date"].dt.floor("D")
+
+    daily = (
+        df.sort_values("Date")
+        .groupby("day")
+        .agg(
+            plant_avg_irradiance_wm2=(irr_col, "last"),
+            plant_irr_records=("Timestamp", "size"),
+        )
+        .reset_index()
+    )
+
+    stats = {
+        "rows": float(len(df)),
+        "duplicates_removed": float(duplicates_removed),
+        "irr_invalid_to_nan": float(invalid_count),
+        "irr_unstable_days_removed": 0.0,
+        "daily_rows": float(len(daily)),
+    }
+    return daily, stats
+
+
+def load_runtime_daily(
+    path: Path,
+    min_hours: float,
+    max_hours: float,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """Load runtime CSV and return one runtime value per day with QC flags."""
+    if not path.exists():
+        return pd.DataFrame(columns=["day", "runtime_h_csv", "runtime_csv_invalid"]), {
+            "runtime_rows": 0.0,
+            "runtime_daily_rows": 0.0,
+            "runtime_invalid_days": 0.0,
+        }
+
+    try:
+        df = pd.read_csv(path, sep=";")
+    except Exception:
+        df = pd.read_csv(path)
+
+    if "Timestamp" not in df.columns:
+        return pd.DataFrame(columns=["day", "runtime_h_csv", "runtime_csv_invalid"]), {
+            "runtime_rows": float(len(df)),
+            "runtime_daily_rows": 0.0,
+            "runtime_invalid_days": 0.0,
+        }
+
+    runtime_col = None
+    for candidate in ("runtime_hours", "Temperature"):
+        if candidate in df.columns:
+            runtime_col = candidate
+            break
+    if runtime_col is None:
+        return pd.DataFrame(columns=["day", "runtime_h_csv", "runtime_csv_invalid"]), {
+            "runtime_rows": float(len(df)),
+            "runtime_daily_rows": 0.0,
+            "runtime_invalid_days": 0.0,
+        }
+
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    df[runtime_col] = pd.to_numeric(df[runtime_col], errors="coerce")
+    df = df.dropna(subset=["Timestamp"])
+    df["day"] = df["Timestamp"].dt.floor("D")
+    daily = (
+        df.groupby("day")
+        .agg(runtime_h_csv=(runtime_col, "max"))
+        .reset_index()
+    )
+    invalid = daily["runtime_h_csv"].notna() & (
+        (daily["runtime_h_csv"] < min_hours) | (daily["runtime_h_csv"] > max_hours)
+    )
+    daily["runtime_csv_invalid"] = invalid
+    daily.loc[invalid, "runtime_h_csv"] = np.nan
+
+    stats = {
+        "runtime_rows": float(len(df)),
+        "runtime_daily_rows": float(len(daily)),
+        "runtime_invalid_days": float(int(invalid.sum())),
+    }
+    return daily, stats
+
+
+def load_solcast_runtime_daily(path: Path) -> pd.DataFrame:
+    """Estimate daily daylight runtime from Solcast GTI > 0 rows."""
+    if not path.exists():
+        return pd.DataFrame(columns=["day", "runtime_solcast_h"])
+
+    df = pd.read_csv(path)
+    if "period_end" not in df.columns or "gti_w_m2" not in df.columns:
+        return pd.DataFrame(columns=["day", "runtime_solcast_h"])
+
+    df["period_end"] = pd.to_datetime(df["period_end"], errors="coerce", utc=True)
+    df["gti_w_m2"] = pd.to_numeric(df["gti_w_m2"], errors="coerce")
+    df = df.dropna(subset=["period_end"])
+    df["day"] = (
+        df["period_end"]
+        .dt.tz_convert("Asia/Colombo")
+        .dt.tz_localize(None)
+        .dt.floor("D")
+    )
+    daily = (
+        df.assign(_sun=df["gti_w_m2"] > 0)
+        .groupby("day")
+        .agg(runtime_solcast_h=("_sun", "sum"))
+        .reset_index()
+    )
+    daily["runtime_solcast_h"] = daily["runtime_solcast_h"] * (10.0 / 60.0)
+    return daily
+
+
+def _normalize_inverter_id(label: str) -> str:
+    """Normalize inverter labels to lowercase underscore form (e.g., B2-08 -> b2_08)."""
+    return label.strip().lower().replace("-", "_")
+
+
+def _inverter_id_from_power_col(col: str) -> Optional[str]:
+    """Extract normalized inverter id from '<INV> Active Power (W)' column names."""
+    if not col.endswith("Active Power (W)"):
+        return None
+    return _normalize_inverter_id(col.replace(" Active Power (W)", ""))
+
+
+def _build_daily_model_table_legacy(
     inverters: pd.DataFrame,
     irradiance: pd.DataFrame,
     generation_daily: pd.DataFrame,
     solcast_daily: pd.DataFrame = None,
     pvlib_soiling_daily: pd.DataFrame = None,
+    inv_daily_gen: pd.DataFrame = None,
+    plant_avg_irr: pd.DataFrame = None,
+    runtime_daily: pd.DataFrame = None,
+    runtime_solcast_daily: pd.DataFrame = None,
+    power_at_ref_irr: pd.DataFrame = None,
     peak_filtered: bool = False,
+    inverter_capacity_kw: float = 330.0,
+    plant_inverter_count: int = 34,
 ) -> pd.DataFrame:
     """Build the daily model input table from cleaned sub-daily data.
 
@@ -208,6 +492,12 @@ def build_daily_model_table(
     peak_filtered : bool
         If True, coverage ratios use peak-hour expected record counts
         instead of full-day counts.
+    inv_daily_gen : pd.DataFrame or None
+        Per-inverter daily_generated_electricity (cleaned, in Joules).
+    plant_avg_irr : pd.DataFrame or None
+        Plant-level avg_solar_radiation (cleaned, W/m^2).
+    power_at_ref_irr : pd.DataFrame or None
+        Power at reference irradiance feature (daily).
     """
     inv = inverters.copy()
     irr = irradiance.copy()
@@ -255,6 +545,63 @@ def build_daily_model_table(
     if pvlib_soiling_daily is not None and not pvlib_soiling_daily.empty:
         daily = daily.merge(pvlib_soiling_daily, on="day", how="left")
 
+    # --- Per-inverter daily generated electricity ---
+    n_subset_inverters = 0
+    if inv_daily_gen is not None and not inv_daily_gen.empty:
+        daily = daily.merge(inv_daily_gen, on="day", how="left")
+        gen_j_cols = [c for c in inv_daily_gen.columns if c.endswith("_daily_gen_j")]
+        n_subset_inverters = len(gen_j_cols)
+        if gen_j_cols:
+            daily["subset_daily_gen_j"] = daily[gen_j_cols].sum(axis=1, min_count=1)
+            daily["subset_daily_gen_kwh"] = daily["subset_daily_gen_j"] / 3.6e6
+
+    # --- Plant-level average solar radiation ---
+    if plant_avg_irr is not None and not plant_avg_irr.empty:
+        daily = daily.merge(plant_avg_irr, on="day", how="left")
+
+    # --- Power at reference irradiance ---
+    if power_at_ref_irr is not None and not power_at_ref_irr.empty:
+        daily = daily.merge(power_at_ref_irr, on="day", how="left")
+
+    # --- Generation / irradiance ratio (new data) ---
+    if (
+        "subset_daily_gen_kwh" in daily.columns
+        and "plant_avg_irradiance_wm2" in daily.columns
+    ):
+        valid = (
+            daily["plant_avg_irradiance_wm2"].notna()
+            & (daily["plant_avg_irradiance_wm2"] > 0)
+            & daily["subset_daily_gen_kwh"].notna()
+        )
+        # gen_irr_ratio = subset_daily_gen_kwh / plant_avg_irradiance_wm2
+        #
+        # NOTE: This is NOT a proper Performance Ratio (PR). A true PR would be:
+        #   PR = E_measured / (H_total × P_rated)
+        # where H_total = avg_irradiance × daylight_hours / 1000 (kWh/m²)
+        # and P_rated = n_inverters × P_NOM_KWP (kW).
+        #
+        # This is BLOCKED because P_NOM_KWP = 75 kWp is a placeholder
+        # (actual inverter capacity is ~200-400 kW based on daily output of
+        # ~1000 kWh/inverter). Until the true nameplate is confirmed from the
+        # asset owner, the PR formula would produce incorrect absolute values.
+        #
+        # For SOILING DETECTION this does not matter: the ratio is always used
+        # relative to its own rolling baseline (gen_irr_ratio / rolling_baseline),
+        # so any constant scaling factor (daylight hours, P_rated) cancels out.
+        # The simple ratio preserves all soiling signal information.
+        h_total = daily["plant_avg_irradiance_wm2"]  # W/m² (daily average)
+
+        daily["gen_irr_ratio"] = np.where(
+            valid,
+            daily["subset_daily_gen_kwh"] / h_total,
+            np.nan,
+        )
+        daily["gen_irr_ratio_smoothed"] = (
+            daily["gen_irr_ratio"]
+            .rolling(7, center=True, min_periods=3)
+            .median()
+        )
+
     # --- Derived energy columns ---
     daily["subset_energy_mwh"] = daily["subset_energy_j"] / 3.6e9
     daily["generation_mwh"] = daily["daily_generation_j"] / 3.6e9
@@ -296,6 +643,19 @@ def build_daily_model_table(
     )
     daily = compute_cycle_deviation(daily, irr_sum_col=_irr_col_for_cycle)
 
+    # --- New-source performance features (gen_irr_ratio based) ---
+    if "gen_irr_ratio" in daily.columns and daily["gen_irr_ratio"].notna().sum() > 10:
+        daily = compute_loss_proxy_from_ratio(
+            daily, ratio_col="gen_irr_ratio", prefix="new",
+        )
+        daily = compute_cycle_deviation(
+            daily, precomputed_x_col="gen_irr_ratio", prefix="new",
+        )
+        if "new_rolling_clean_baseline" in daily.columns:
+            daily["new_performance_index"] = (
+                daily["gen_irr_ratio"] / daily["new_rolling_clean_baseline"]
+            ).clip(upper=1.5)
+
     # --- Temperature correction ---
     daily = compute_temperature_corrected_pr(daily)
 
@@ -311,6 +671,286 @@ def build_daily_model_table(
     daily = compute_transfer_readiness(daily)
 
     # --- Clear-Sky Analyzable flag (requires flag_count + transfer tier) ---
+    daily = flag_clear_sky_analyzable(daily)
+
+    return daily
+
+
+def build_daily_model_table(
+    inverters: pd.DataFrame,
+    irradiance: pd.DataFrame,
+    generation_daily: pd.DataFrame,
+    solcast_daily: pd.DataFrame = None,
+    pvlib_soiling_daily: pd.DataFrame = None,
+    inv_daily_gen: pd.DataFrame = None,
+    plant_avg_irr: pd.DataFrame = None,
+    runtime_daily: pd.DataFrame = None,
+    runtime_solcast_daily: pd.DataFrame = None,
+    power_at_ref_irr: pd.DataFrame = None,
+    peak_filtered: bool = False,
+    inverter_capacity_kw: float = 330.0,
+    plant_inverter_count: int = 34,
+) -> pd.DataFrame:
+    """Build the daily model table with old-source and physical new-source metrics."""
+    inv = inverters.copy()
+    irr = irradiance.copy()
+    gen = generation_daily.copy()
+
+    inv_expected = PEAK_INV_RECORDS_PER_DAY if peak_filtered else None
+    irr_expected = PEAK_IRR_RECORDS_PER_DAY if peak_filtered else None
+
+    # --- Inverter daily aggregation (combined) ---
+    agg_kwargs_inv = {} if inv_expected is None else {"expected_records": inv_expected}
+    inv_daily, power_cols = aggregate_inverter_daily(inv, **agg_kwargs_inv)
+    power_inv_ids = sorted(
+        {
+            inv_id
+            for col in power_cols
+            for inv_id in [_inverter_id_from_power_col(col)]
+            if inv_id is not None
+        }
+    )
+
+    # --- Block (B1 vs B2) daily aggregation ---
+    block_daily = aggregate_block_daily(inv, power_cols)
+    if not block_daily.empty:
+        inv_daily = inv_daily.merge(block_daily, on="day", how="left")
+
+    # --- Tier-1 / Tier-2 daily aggregation ---
+    tier_daily = aggregate_tier_daily(inv, power_cols)
+    if not tier_daily.empty:
+        inv_daily = inv_daily.merge(tier_daily, on="day", how="left")
+
+    # --- Irradiance daily aggregation ---
+    agg_kwargs_irr = {} if irr_expected is None else {"expected_records": irr_expected}
+    irr_daily = aggregate_irradiance_daily(irr, **agg_kwargs_irr)
+
+    # --- Per-inverter daily metrics (energy, PR, normalized output) ---
+    per_inv = aggregate_per_inverter_daily(inv, irr_daily, p_nom_kwp=P_NOM_KWP)
+    if not per_inv.empty:
+        inv_daily = inv_daily.merge(per_inv, on="day", how="left")
+
+    # --- Merge all daily tables ---
+    daily = (
+        inv_daily.merge(irr_daily, on="day", how="outer")
+        .merge(gen, on="day", how="outer")
+        .sort_values("day")
+        .reset_index(drop=True)
+    )
+
+    # --- Solcast environmental features ---
+    if solcast_daily is not None and not solcast_daily.empty:
+        daily = daily.merge(solcast_daily, on="day", how="left")
+
+    # --- pvlib soiling estimates ---
+    if pvlib_soiling_daily is not None and not pvlib_soiling_daily.empty:
+        daily = daily.merge(pvlib_soiling_daily, on="day", how="left")
+
+    # --- Per-inverter daily generated electricity (aligned to power-tier assets) ---
+    aligned_inv_ids: List[str] = []
+    daily["subset_daily_gen_expected_count"] = float(len(power_inv_ids))
+    if inv_daily_gen is not None and not inv_daily_gen.empty:
+        daily = daily.merge(inv_daily_gen, on="day", how="left")
+        gen_j_cols = [c for c in inv_daily_gen.columns if c.endswith("_daily_gen_j")]
+        gen_inv_map = {c[:-len("_daily_gen_j")]: c for c in gen_j_cols}
+        aligned_inv_ids = [inv_id for inv_id in power_inv_ids if inv_id in gen_inv_map]
+        aligned_cols = [gen_inv_map[inv_id] for inv_id in aligned_inv_ids]
+        if aligned_cols:
+            daily["subset_daily_gen_j"] = daily[aligned_cols].sum(axis=1, min_count=1)
+            daily["subset_daily_gen_kwh"] = daily["subset_daily_gen_j"] / 3.6e6
+            daily["subset_daily_gen_inverter_count"] = daily[aligned_cols].notna().sum(axis=1)
+            expected = max(len(power_inv_ids), 1)
+            daily["subset_daily_gen_coverage"] = (
+                daily["subset_daily_gen_inverter_count"] / float(expected)
+            )
+        else:
+            daily["subset_daily_gen_j"] = np.nan
+            daily["subset_daily_gen_kwh"] = np.nan
+            daily["subset_daily_gen_inverter_count"] = 0.0
+            daily["subset_daily_gen_coverage"] = 0.0
+    else:
+        daily["subset_daily_gen_inverter_count"] = np.nan
+        daily["subset_daily_gen_coverage"] = np.nan
+
+    # --- Plant-level average solar radiation ---
+    if plant_avg_irr is not None and not plant_avg_irr.empty:
+        daily = daily.merge(plant_avg_irr, on="day", how="left")
+
+    # --- Runtime handling: CSV first, then Solcast daylight fallback ---
+    if runtime_daily is not None and not runtime_daily.empty:
+        daily = daily.merge(runtime_daily, on="day", how="left")
+    if runtime_solcast_daily is not None and not runtime_solcast_daily.empty:
+        daily = daily.merge(runtime_solcast_daily, on="day", how="left")
+    if ("runtime_h_csv" in daily.columns) or ("runtime_solcast_h" in daily.columns):
+        runtime_csv = (
+            daily["runtime_h_csv"]
+            if "runtime_h_csv" in daily.columns
+            else pd.Series(np.nan, index=daily.index)
+        )
+        runtime_solcast = (
+            daily["runtime_solcast_h"]
+            if "runtime_solcast_h" in daily.columns
+            else pd.Series(np.nan, index=daily.index)
+        )
+        daily["runtime_h"] = runtime_csv.combine_first(runtime_solcast)
+        src = pd.Series(np.nan, index=daily.index, dtype=object)
+        src.loc[runtime_csv.notna()] = "runtime_csv"
+        src.loc[src.isna() & runtime_solcast.notna()] = "solcast_daylight"
+        daily["runtime_source"] = src
+
+    # --- Power at reference irradiance ---
+    if power_at_ref_irr is not None and not power_at_ref_irr.empty:
+        daily = daily.merge(power_at_ref_irr, on="day", how="left")
+
+    # --- Physical irradiation and PR fields ---
+    daily["subset_capacity_kw"] = float(len(aligned_inv_ids) * inverter_capacity_kw)
+    daily["plant_capacity_kw"] = float(plant_inverter_count * inverter_capacity_kw)
+
+    if "plant_avg_irradiance_wm2" in daily.columns and "runtime_h" in daily.columns:
+        valid_irr = (
+            daily["plant_avg_irradiance_wm2"].notna()
+            & (daily["plant_avg_irradiance_wm2"] > 0)
+            & daily["runtime_h"].notna()
+            & (daily["runtime_h"] > 0)
+        )
+        daily["irradiation_kwh_m2"] = np.where(
+            valid_irr,
+            daily["plant_avg_irradiance_wm2"] * daily["runtime_h"] / 1000.0,
+            np.nan,
+        )
+
+    if (
+        "subset_daily_gen_kwh" in daily.columns
+        and "irradiation_kwh_m2" in daily.columns
+        and daily["subset_capacity_kw"].iloc[0] > 0
+    ):
+        denom_subset = daily["subset_capacity_kw"] * daily["irradiation_kwh_m2"]
+        valid_subset = (
+            daily["subset_daily_gen_kwh"].notna()
+            & denom_subset.notna()
+            & (denom_subset > 0)
+        )
+        subset_pr_raw = pd.Series(np.nan, index=daily.index, dtype=float)
+        subset_pr_raw.loc[valid_subset] = (
+            daily.loc[valid_subset, "subset_daily_gen_kwh"] / denom_subset.loc[valid_subset]
+        )
+        subset_outlier = subset_pr_raw.notna() & (
+            (subset_pr_raw < 0) | (subset_pr_raw > 1)
+        )
+        subset_interp = subset_pr_raw.mask(subset_outlier).interpolate(
+            method="linear", limit_area="inside",
+        )
+        daily["subset_pr_physical_raw"] = subset_pr_raw
+        daily["subset_pr_physical_outlier"] = subset_outlier
+        daily["subset_pr_physical_interp"] = subset_interp
+        daily["subset_pr_physical_roll7"] = subset_interp.rolling(
+            7, center=True, min_periods=3,
+        ).median()
+
+        # Backward-compatible alias fields
+        daily["gen_irr_ratio"] = daily["subset_pr_physical_raw"]
+        daily["gen_irr_ratio_smoothed"] = daily["gen_irr_ratio"].rolling(
+            7, center=True, min_periods=3,
+        ).median()
+
+    if (
+        "daily_generation_j" in daily.columns
+        and "irradiation_kwh_m2" in daily.columns
+        and "plant_capacity_kw" in daily.columns
+    ):
+        daily["daily_generation_kwh"] = daily["daily_generation_j"] / 3.6e6
+        denom_plant = daily["plant_capacity_kw"] * daily["irradiation_kwh_m2"]
+        valid_plant = (
+            daily["daily_generation_kwh"].notna()
+            & denom_plant.notna()
+            & (denom_plant > 0)
+        )
+        plant_pr_raw = pd.Series(np.nan, index=daily.index, dtype=float)
+        plant_pr_raw.loc[valid_plant] = (
+            daily.loc[valid_plant, "daily_generation_kwh"] / denom_plant.loc[valid_plant]
+        )
+        plant_outlier = plant_pr_raw.notna() & (
+            (plant_pr_raw < 0) | (plant_pr_raw > 1)
+        )
+        plant_interp = plant_pr_raw.mask(plant_outlier).interpolate(
+            method="linear", limit_area="inside",
+        )
+        daily["plant_pr_physical_raw"] = plant_pr_raw
+        daily["plant_pr_physical_outlier"] = plant_outlier
+        daily["plant_pr_physical_interp"] = plant_interp
+        daily["plant_pr_physical_roll7"] = plant_interp.rolling(
+            7, center=True, min_periods=3,
+        ).median()
+
+    # --- Derived energy columns ---
+    daily["subset_energy_mwh"] = daily["subset_energy_j"] / 3.6e9
+    daily["generation_mwh"] = daily["daily_generation_j"] / 3.6e9
+    daily["plant_to_subset_energy_ratio"] = daily["generation_mwh"] / daily["subset_energy_mwh"]
+
+    # --- Performance loss features ---
+    daily = compute_performance_features(daily)
+    daily = compute_performance_features(daily, energy_col="t1_energy_j", prefix="t1")
+    daily = compute_performance_features(daily, energy_col="t2_energy_j", prefix="t2")
+
+    # --- Combined PR (all tiered inverters) ---
+    n_power_cols = len(power_cols)
+    if "irradiance_tilted_sum" in daily.columns and n_power_cols > 0:
+        daily["subset_pr"] = compute_performance_ratio(
+            daily["subset_energy_j"],
+            daily["irradiance_tilted_sum"],
+            p_nom_kwp=P_NOM_KWP,
+            n_inverters=n_power_cols,
+        )
+
+    # --- Cross-block correlation ---
+    daily = compute_cross_block_correlation(daily)
+
+    # --- Soiling feature engineering ---
+    daily = compute_soiling_features(daily)
+
+    # --- Domain Soiling Pressure Index ---
+    daily = compute_domain_soiling_index(daily)
+
+    # --- Cycle-aware deviation ---
+    _irr_col_for_cycle = (
+        "solcast_gti_peak_sum"
+        if "solcast_gti_peak_sum" in daily.columns
+        and daily["solcast_gti_peak_sum"].notna().sum() > 0
+        else "irradiance_tilted_sum"
+    )
+    daily = compute_cycle_deviation(daily, irr_sum_col=_irr_col_for_cycle)
+
+    # --- New-source performance features (from physical PR alias) ---
+    if "subset_daily_gen_kwh" in daily.columns and "irradiation_kwh_m2" in daily.columns:
+        daily["gen_irr_ratio"] = daily["subset_daily_gen_kwh"] / ((inverter_capacity_kw * plant_inverter_count) * daily["irradiation_kwh_m2"])
+
+    if "gen_irr_ratio" in daily.columns and daily["gen_irr_ratio"].notna().sum() > 10:
+        daily = compute_loss_proxy_from_ratio(
+            daily, ratio_col="gen_irr_ratio", prefix="new",
+        )
+        daily = compute_cycle_deviation(
+            daily, precomputed_x_col="gen_irr_ratio", prefix="new",
+        )
+        if "new_rolling_clean_baseline" in daily.columns:
+            daily["new_performance_index"] = (
+                daily["gen_irr_ratio"] / daily["new_rolling_clean_baseline"]
+            ).clip(upper=1.5)
+
+    # --- Temperature correction ---
+    daily = compute_temperature_corrected_pr(daily)
+
+    # --- Common-overlap window ---
+    daily = compute_common_overlap(daily)
+
+    # --- Quality flags (shared logic) ---
+    daily = compute_quality_flags(daily)
+    flag_cols = [c for c in daily.columns if c.startswith("flag_")]
+    daily["flag_count"] = daily[flag_cols].fillna(False).sum(axis=1)
+
+    # --- Transfer readiness (shared logic) ---
+    daily = compute_transfer_readiness(daily)
+
+    # --- Clear-Sky analyzable flag ---
     daily = flag_clear_sky_analyzable(daily)
 
     return daily
@@ -481,6 +1121,45 @@ def main() -> None:
         default=False,
         help="Disable peak-hour and irradiance-threshold filtering (use all records).",
     )
+    parser.add_argument(
+        "--inverter-capacity-kw",
+        type=float,
+        default=330.0,
+        help="Nameplate inverter AC capacity in kW for physical PR calculation.",
+    )
+    parser.add_argument(
+        "--plant-inverter-count",
+        type=int,
+        default=34,
+        help="Plant inverter count for plant-level physical PR denominator.",
+    )
+    parser.add_argument(
+        "--runtime-min-hours",
+        type=float,
+        default=6.0,
+        help="Minimum valid runtime hours from runtime CSV.",
+    )
+    parser.add_argument(
+        "--runtime-max-hours",
+        type=float,
+        default=18.0,
+        help="Maximum valid runtime hours from runtime CSV.",
+    )
+    parser.add_argument(
+        "--runtime-csv",
+        type=Path,
+        default=DEFAULT_RUNTIME_CSV,
+        help="Runtime CSV path (uses runtime_hours column when available).",
+    )
+    parser.add_argument(
+        "--disable-new-source-if-clipped-pct",
+        type=float,
+        default=5.0,
+        help=(
+            "Disable new-source PR fields if fetch audit above-warning share exceeds this percent. "
+            "Set negative to disable the gate."
+        ),
+    )
     args = parser.parse_args()
 
     # Prefer tiered primary file if it exists (produced by split_inverter_tiers.py),
@@ -547,15 +1226,139 @@ def main() -> None:
         if not pvlib_soiling_daily.empty:
             print(f"  pvlib soiling estimates: {len(pvlib_soiling_daily)} days")
 
+    # --- New telemetry: per-inverter daily generated electricity (optional) ---
+    inv_daily_gen_daily = None
+    inv_daily_gen_audit = pd.DataFrame()
+    new_source_disabled = False
+    inv_daily_gen_path = args.data_dir / "inverters_daily_gen_2025_to_current_none_si.csv"
+    fetch_audit_path = args.data_dir / "inverters_daily_gen_fetch_audit.json"
+    if inv_daily_gen_path.exists():
+        inv_daily_gen_daily, inv_daily_gen_audit, idg_stats = clean_inverter_daily_gen(
+            inv_daily_gen_path
+        )
+        print(
+            f"  Inverter daily gen: {int(idg_stats['daily_rows'])} days, "
+            f"{int(idg_stats['inverter_count'])} inverters"
+        )
+        clip_pct = None
+        if fetch_audit_path.exists():
+            try:
+                payload = json.loads(fetch_audit_path.read_text(encoding="utf-8"))
+                clip_pct = float(payload.get("global", {}).get("above_warning_pct"))
+            except Exception:
+                clip_pct = None
+        if clip_pct is not None:
+            print(
+                "  Inverter daily-gen fetch audit: "
+                f"above-warning={clip_pct:.3f}% (threshold={args.disable_new_source_if_clipped_pct:.3f}%)"
+            )
+            if (
+                args.disable_new_source_if_clipped_pct >= 0
+                and clip_pct > args.disable_new_source_if_clipped_pct
+            ):
+                new_source_disabled = True
+                # inv_daily_gen_daily = None  # FORCE ENABLE: We rely on this new metric regardless of clipping.
+                print(
+                    "  WARNING: New daily-gen source flagged high above-warning share in fetch audit (BYPASSING DISABLE)."
+                )
+    else:
+        idg_stats = {}
+
+    # --- New telemetry: plant-level average solar radiation (optional) ---
+    plant_avg_irr_daily = None
+    plant_avg_irr_path = args.data_dir / "plant_avg_irradiance_2025_to_current_none_si.csv"
+    if plant_avg_irr_path.exists():
+        plant_avg_irr_daily, pai_stats = clean_plant_avg_irradiance(plant_avg_irr_path)
+        print(
+            f"  Plant avg irradiance: {int(pai_stats['daily_rows'])} days, "
+            f"{int(pai_stats['irr_unstable_days_removed'])} unstable days removed"
+        )
+
+    # --- Runtime daily (CSV primary + Solcast fallback) ---
+    runtime_daily, runtime_stats = load_runtime_daily(
+        args.runtime_csv,
+        min_hours=args.runtime_min_hours,
+        max_hours=args.runtime_max_hours,
+    )
+    runtime_solcast_daily = load_solcast_runtime_daily(solcast_irradiance_path)
+    print(
+        "  Runtime CSV: "
+        f"{int(runtime_stats['runtime_daily_rows'])} days, "
+        f"invalid={int(runtime_stats['runtime_invalid_days'])}, "
+        f"bounds=[{args.runtime_min_hours}, {args.runtime_max_hours}] h"
+    )
+    if not runtime_solcast_daily.empty:
+        print(f"  Runtime Solcast fallback: {len(runtime_solcast_daily)} days")
+
+    # --- Power at reference irradiance (from existing sub-daily data) ---
+    ref_irr_daily = compute_power_at_reference_irradiance(inv_clean, irr_clean)
+    if not ref_irr_daily.empty:
+        print(
+            f"  Power at ref irradiance: {len(ref_irr_daily)} days, "
+            f"ref={ref_irr_daily['ref_irradiance_wm2'].iloc[0]:.0f} W/m²"
+        )
+
     daily_model = build_daily_model_table(
         inv_clean, irr_clean, gen_daily, solcast_daily, pvlib_soiling_daily,
+        inv_daily_gen=inv_daily_gen_daily,
+        plant_avg_irr=plant_avg_irr_daily,
+        runtime_daily=runtime_daily,
+        runtime_solcast_daily=runtime_solcast_daily,
+        power_at_ref_irr=ref_irr_daily,
         peak_filtered=not args.no_peak_filter,
+        inverter_capacity_kw=args.inverter_capacity_kw,
+        plant_inverter_count=args.plant_inverter_count,
     )
+    if new_source_disabled:
+        print("  New-source daily generation was disabled by fetch-audit gate.")
 
     inv_clean.to_csv(args.out_dir / "inverters_clean.csv", index=False)
     irr_clean.to_csv(args.out_dir / "irradiance_clean.csv", index=False)
     gen_clean.to_csv(args.out_dir / "generation_clean.csv", index=False)
     gen_daily.to_csv(args.out_dir / "generation_daily_clean.csv", index=False)
+    audit_out = args.out_dir / "inverter_daily_gen_audit.csv"
+    if inv_daily_gen_audit is not None and not inv_daily_gen_audit.empty:
+        inv_daily_gen_audit.to_csv(audit_out, index=False)
+    else:
+        pd.DataFrame(
+            columns=[
+                "day",
+                "inverter",
+                "records",
+                "non_null_records",
+                "last_valid_dt",
+                "last_kwh",
+                "max_kwh",
+                "p99_kwh",
+                "selected_kwh",
+                "selection_method",
+                "outlier_flag",
+                "selected_kwh_clean",
+            ]
+        ).to_csv(audit_out, index=False)
+
+    if (
+        "subset_daily_gen_kwh" in daily_model.columns
+        and "irradiation_kwh_m2" in daily_model.columns
+    ):
+        corr_mask = (
+            daily_model["subset_daily_gen_kwh"].notna()
+            & daily_model["irradiation_kwh_m2"].notna()
+            & (daily_model["irradiation_kwh_m2"] > 0)
+        )
+        if int(corr_mask.sum()) >= 10:
+            corr_val = float(
+                daily_model.loc[corr_mask, "subset_daily_gen_kwh"].corr(
+                    daily_model.loc[corr_mask, "irradiation_kwh_m2"]
+                )
+            )
+            if np.isfinite(corr_val):
+                print(f"  Corr(subset_daily_gen_kwh, irradiation_kwh_m2)={corr_val:.3f}")
+                if corr_val < 0.30:
+                    print("  WARNING: Correlation below 0.30; inspect generation source quality.")
+    if "runtime_source" in daily_model.columns:
+        src_counts = daily_model["runtime_source"].fillna("missing").value_counts().to_dict()
+        print(f"  Runtime source distribution: {src_counts}")
 
     # Optionally trim the primary output to overlap-valid days
     if args.trim_to_overlap and "in_common_overlap" in daily_model.columns:

@@ -19,13 +19,13 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python scripts/eda_soiling_signals.py
+python scripts/5_eda/soiling_signals.py
 ```
 
 Custom paths:
 
 ```bash
-python scripts/eda_soiling_signals.py --input path/to/daily_model_eda.csv --out-dir artifacts/eda
+python scripts/5_eda/soiling_signals.py --input path/to/daily_model_eda.csv --out-dir artifacts/eda
 ```
 
 ## Inputs
@@ -34,7 +34,7 @@ python scripts/eda_soiling_signals.py --input path/to/daily_model_eda.csv --out-
 |---|---|
 | `artifacts/preprocessed/daily_model_eda.csv` | Daily feature table (361 rows, 118 columns) |
 
-The script also imports constants from `scripts/daily_features.py`:
+The script also imports constants from `scripts/core/daily_features.py`:
 `CLEANING_CAMPAIGN_DATES`, `SIGNIFICANT_RAIN_MM`, `SITE_LAT`, `SITE_LON`.
 
 ## What It Does
@@ -94,6 +94,16 @@ All saved to `artifacts/eda/plots/`:
 | `c1_clear_sky_loss_timeseries.png` | CSA | Loss proxy on clear-sky days (CSA dots over faded HQ backdrop) |
 | `c2_clean_vs_all_correlations.png` | CSA | Side-by-side correlation comparison: All HQ vs CSA-filtered |
 | `c3_clean_scatter_matrix.png` | CSA | 2x2 scatter matrix of top soiling predictors on CSA days |
+| `dq1_irradiance_vs_generation_timeseries.png` | DQ | Dual-axis time series of on-site irradiance & T1 generation (full-width, readable x-axis) |
+| `dq1_irradiance_vs_generation.png` | DQ | On-site irradiance vs generation: scatter plots (colour by month) + monthly normalised output boxplot |
+| `dq2_daily_gen_validation_timeseries.png` | DQ | Stacked time series: new gen vs old energy, plant irradiance vs Solcast. Skipped if new data absent. |
+| `dq2_daily_gen_validation.png` | DQ | Scatter panels: old vs new generation, plant avg vs Solcast irradiance. Skipped if new data absent. |
+| `dq3_gen_irr_ratio_timeseries.png` | DQ | Stacked time series: gen/irr ratio with context, ratio vs loss proxy overlay. Skipped if new data absent. |
+| `dq3_gen_irr_ratio.png` | DQ | Monthly boxplot of generation/irradiance ratio. Skipped if new data absent. |
+| `dq4_power_at_ref_irradiance.png` | DQ | Active power at median irradiance level: time-series and correlation bar chart (2 panels) |
+| `dq5_old_vs_new_timeseries.png` | DQ | Stacked time series: loss proxy overlay (old vs new), cycle deviation overlay (old vs new). Skipped if new-source features absent. |
+| `dq5_old_vs_new_comparison.png` | DQ | Scatter (old vs new loss proxy) + correlation comparison bar chart. Skipped if new-source features absent. |
+| `dq6_performance_index.png` | DQ | New-source 0-1 performance index: time-series, distribution histogram, correlation scatter vs soiling features (3 panels). Skipped if new-source features absent. |
 
 ## Validation Checks
 
@@ -102,6 +112,8 @@ Verify output completeness:
 ```powershell
 python -c "import os; plots=[f for f in os.listdir('artifacts/eda/plots') if f.endswith('.png')]; print(f'{len(plots)} plots'); assert len(plots) >= 22, 'Expected at least 22 plots'"
 ```
+
+Note: If new telemetry files are present, up to 9 additional DQ plots are generated (dq1-ts, dq2-ts, dq2, dq3-ts, dq3, dq4, dq5-ts, dq5, dq6).
 
 Verify the report exists and contains all signal verdicts:
 

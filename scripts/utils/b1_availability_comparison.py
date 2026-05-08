@@ -5,7 +5,7 @@ per-inverter daily availability, and produces a ranked report.
 
 Usage::
 
-    python scripts/b1_availability_comparison.py
+    python scripts/utils/b1_availability_comparison.py
 
 Outputs (artifacts/b1_availability/):
     b1_all_availability.csv     – per-inverter daily availability

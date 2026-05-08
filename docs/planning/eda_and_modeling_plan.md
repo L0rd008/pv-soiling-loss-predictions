@@ -63,31 +63,31 @@ Gaps identified from methodology comparison, ordered by priority.
 
 ### High priority
 
-**Peak-hour filtering.** ✅ Implemented in `scripts/daily_features.py`:
+**Peak-hour filtering.** ✅ Implemented in `scripts/core/daily_features.py`:
 `filter_peak_hours()`. Default window 10:00–14:00 local time, applied to both
 inverter and irradiance records before daily aggregation. Disable with
 `--no-peak-filter` flag in `data_preprocess.py`.
 
 **Per-timestamp irradiance threshold.** ✅ Implemented in
-`scripts/daily_features.py`: `filter_irradiance_threshold()`. Threshold is
+`scripts/core/daily_features.py`: `filter_irradiance_threshold()`. Threshold is
 derived from data at runtime (10th percentile of positive peak-hour irradiance
 values), auto-tuning for the sensor's unit conventions. An explicit override
 threshold can also be passed.
 
-**Proper Performance Ratio.** ✅ Implemented in `scripts/daily_features.py`:
+**Proper Performance Ratio.** ✅ Implemented in `scripts/core/daily_features.py`:
 `compute_performance_ratio()`. Uses configurable `P_NOM_KWP` (placeholder:
 75 kWp). PR = E_actual / (P_nom × H_POA / G_STC), producing a dimensionless
 value. Replace `P_NOM_KWP` with confirmed value from asset owner.
 
 ### Medium priority
 
-**Per-inverter daily metrics.** ✅ Implemented in `scripts/daily_features.py`:
+**Per-inverter daily metrics.** ✅ Implemented in `scripts/core/daily_features.py`:
 `aggregate_per_inverter_daily()`. Computes per-inverter energy, PR, and
 normalized output for all 6 tiered inverters. Enables per-inverter sawtooth
 visualization and cleaning event detection during EDA.
 
 **Temperature-corrected PR via pvlib.** ✅ Implemented in
-`scripts/daily_features.py`: `compute_temperature_corrected_pr()`. Uses
+`scripts/core/daily_features.py`: `compute_temperature_corrected_pr()`. Uses
 `pvlib.temperature.sapm_cell()` with Solcast air temperature, wind speed, and
 irradiance. Produces `pr_temperature_corrected` column.
 
@@ -115,14 +115,14 @@ predictors.
 
 | Feature | Source | Description |
 |---|---|---|
-| `days_since_last_rain` | `rain_day` | Count of consecutive days since last `rain_day == True`. |
+| `days_since_last_rain` | `rain_day` | Count of consecutive days since last `rain_day == True`. **Primary soiling predictor.** |
 | `days_since_significant_rain` | `precipitation_total_mm` | Days since last day with precipitation above a threshold (e.g., 2–5 mm). |
-| `cumulative_pm10_since_rain` | `pm10_mean`, `rain_day` | Running sum of `pm10_mean` reset to zero on each rain day. Dust exposure proxy. |
-| `cumulative_pm25_since_rain` | `pm25_mean`, `rain_day` | Same for PM2.5. |
-| `humidity_x_pm10` | `humidity_mean`, `pm10_mean` | Interaction feature: high humidity + high dust → cementation (sticky soiling harder to wash). |
+| `cumulative_pm25_since_rain` | `pm25_mean`, `rain_day` | Running sum of `pm25_mean` reset to zero on each rain day. **Preferred dust exposure proxy** (fine PM adheres more). Log-transform recommended. |
+| `cumulative_pm10_since_rain` | `pm10_mean`, `rain_day` | Same for PM10. Use with caution: PM10 is heavily confounded with dry/sunny weather rather than being pure soiling. |
+| `humidity_x_pm10` | `humidity_mean`, `pm10_mean` | Interaction feature: high humidity + high dust → cementation. Use as a threshold/indicator feature due to non-linear ceiling effects. |
 | `wind_speed_10m_rolling_7d` | `wind_speed_10m_mean` | Rolling 7-day mean wind speed. |
-| `month` | `day` | Calendar month (1–12) for seasonal encoding. |
-| `season` | `day` | Season category derived from month (e.g., dry/wet or monsoon/inter-monsoon for this tropical site). |
+| `month` | `day` | Calendar month (1–12) for seasonal encoding. **Critical for deconfounding raw ratios.** |
+| `season` | `day` | Season category derived from month (e.g., dry/wet or monsoon/inter-monsoon). |
 | `pvlib_soiling_ratio` | Solcast rainfall, PM, tilt, cleaning schedule | Physics-based soiling ratio from `pvlib.soiling.hsu()` or `pvlib.soiling.kimber()`. |
 
 ## pvlib Integration Strategy
@@ -213,21 +213,27 @@ peak-hour filtered 10:00–14:00).
 
 ## Modeling Approach Hierarchy
 
-For reference. Not yet implemented — these are the candidate approaches to
-pursue after EDA confirms viability.
+For reference. These are the candidate approaches to pursue after EDA confirms viability. Due to the inherent weather noise confounding the loss proxies, the Two-Stage Decomposition is the highest priority approach for Stage 6.
+
+### Priority 1: Two-Stage Decomposition Model (Weather vs Soiling)
+
+The fundamental problem with the existing loss proxies is weather noise dominating over the true soiling signal. The solution is a two-stage decomposition:
+1. **Model Expected Base Output**: Build a weather-expected-output model (using irradiance, cloud opacity, temperature) on clear or newly-cleaned days.
+2. **Isolate Soiling Residual**: The residual (Actual - Expected) = Soiling proxy. 
+This fully isolates soiling from weather before attempting predictive soiling modeling.
 
 ### Tier 1: Physics-based (pvlib)
 
 Use pvlib soiling estimate as a standalone baseline prediction. Cheapest to
 implement and provides a physically grounded reference.
 
-### Tier 2: Feature-engineered ML (XGBoost / LightGBM)
+### Tier 2: Feature-engineered ML (Quantile Regression)
 
-- Target: `t1_performance_loss_pct_proxy` (or its 14-day rate of change).
-- Features: `cumulative_pm10_since_rain`, `days_since_rain`,
-  `humidity_x_pm10`, `wind_speed_10m_rolling_7d`, `season`, `month`.
+- **Target**: `new_performance_index` (from `gen_irr_ratio` divided by rolling clean baseline), **NOT** the raw loss proxy (which failed the rain recovery validation).
+- **Features**: `days_since_last_rain`, `log(cumulative_pm25_since_rain)`, thresholded `humidity_x_pm10`, `wind_speed_10m_rolling_7d`, `season`, `month`.
+- **Algorithm**: Quantile regression (e.g., LightGBM regressor with quantile objective at `alpha=0.90`). EDA proved soiling is a *ceiling effect*, constraining maximum possible output rather than uniformly shifting the mean. OLS will severely underestimate soiling.
 - Train on Tier-1 (B2), validate on Tier-2 (B1).
-- ~300 clean high-quality days is sufficient for gradient boosted trees.
+- ~300 clean high-quality days is sufficient.
 
 ### Tier 3: Time-series with exogenous regressors
 
@@ -253,3 +259,4 @@ Realistic ranges based on published soiling studies with similar data:
 
 These ranges assume the go/no-go signals are confirmed during EDA. If the
 sawtooth is not visible or PM/rain correlations are weak, the ceiling is lower.
+

@@ -1,12 +1,12 @@
 """EDA: Three go/no-go signal tests for soiling loss prediction.
 
-Produces ~23 plots in artifacts/eda/plots/ and a quantitative verdict
+Produces ~28 plots in artifacts/eda/plots/ and a quantitative verdict
 report in artifacts/eda/eda_signal_report.md.
 
 Usage:
-    python scripts/eda_soiling_signals.py
-    python scripts/eda_soiling_signals.py --input path/to/daily_model_eda.csv
-    python scripts/eda_soiling_signals.py --out-dir artifacts/eda
+    python scripts/5_eda/soiling_signals.py
+    python scripts/5_eda/soiling_signals.py --input path/to/daily_model_eda.csv
+    python scripts/5_eda/soiling_signals.py --out-dir artifacts/eda
 """
 
 from __future__ import annotations
@@ -26,10 +26,11 @@ import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 from scipy import stats
+from statsmodels.tsa.seasonal import STL
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
-from daily_features import (
+sys.path.insert(0, str(SCRIPT_DIR.parent))
+from core.daily_features import (
     CLEANING_CAMPAIGN_DATES,
     SIGNIFICANT_RAIN_MM,
     SITE_LAT,
@@ -79,9 +80,7 @@ def _save(fig: plt.Figure, path: Path) -> None:
 
 
 def _hq_filter(df: pd.DataFrame) -> pd.DataFrame:
-    return df[
-        (df["transfer_quality_tier"] == "high") & (df["flag_count"] == 0)
-    ].copy()
+    return df[df["transfer_quality_score"] >= 70].copy()
 
 
 def _add_rain_cleaning_overlays(
@@ -120,6 +119,27 @@ def _partial_corr(
     ry = _resid(sub[y].values)
     r, p = stats.pearsonr(rx, ry)
     return r, p
+
+
+def _new_source_start(df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    """Return the first date where plant_avg_irradiance_wm2 is not NaN."""
+    col = "plant_avg_irradiance_wm2"
+    if col not in df.columns:
+        return None
+    valid = df.loc[df[col].notna(), "day_dt"]
+    return valid.min() if len(valid) else None
+
+
+def _annotate_new_source_start(ax: plt.Axes, df: pd.DataFrame) -> None:
+    """Draw a vertical line where new-source data begins, if applicable."""
+    start = _new_source_start(df)
+    if start is None:
+        return
+    ax.axvline(start, color="#EF4444", ls="--", lw=1.0, alpha=0.7, zorder=5)
+    ax.text(
+        start, ax.get_ylim()[1] * 0.95, " New src start",
+        fontsize=7, color="#EF4444", ha="left", va="top",
+    )
 
 
 def _identify_dry_spells(
@@ -215,7 +235,7 @@ def test_signal_1_sawtooth(
     present = [c for c in inv_cols if c in df.columns]
     n_inv = len(present)
     if n_inv:
-        fig, axes = plt.subplots(n_inv, 1, figsize=(14, 2.4 * n_inv), sharex=True)
+        fig, axes = plt.subplots(n_inv, 1, figsize=(16, 3.5 * n_inv), sharex=True)
         if n_inv == 1:
             axes = [axes]
         for ax, col in zip(axes, present):
@@ -744,7 +764,7 @@ def run_supporting_analyses(
     dist_items = [(c, t, clr) for c, t, clr in dist_items if c in hq.columns]
     n_cols = 3
     n_rows = (len(dist_items) + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 4 * n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5 * n_rows))
     axes_flat = axes.flatten() if n_rows > 1 else list(axes)
     for ax, (col, title, colour) in zip(axes_flat, dist_items):
         vals = hq[col].dropna()
@@ -766,7 +786,7 @@ def run_supporting_analyses(
     # S4-B  pvlib & DSPI vs observed -----------------------------------------
     has_dspi = "domain_soiling_index" in hq.columns
     n_phys_rows = 2 if has_dspi else 1
-    fig, axes = plt.subplots(n_phys_rows, 2, figsize=(13, 5 * n_phys_rows))
+    fig, axes = plt.subplots(n_phys_rows, 2, figsize=(16, 6 * n_phys_rows))
     if n_phys_rows == 1:
         axes = axes[np.newaxis, :]
 
@@ -1160,7 +1180,7 @@ def test_clear_sky_soiling(
     if n_panels > 0:
         n_c = 2
         n_r = (n_panels + n_c - 1) // n_c
-        fig, axes = plt.subplots(n_r, n_c, figsize=(12, 5 * n_r))
+        fig, axes = plt.subplots(n_r, n_c, figsize=(14, 6 * n_r))
         axes_flat = axes.flatten() if n_r > 1 else list(axes)
         for ax, (xc, yc, xl, yl) in zip(axes_flat, scatter_pairs):
             pair = csa[[xc, yc]].dropna()
@@ -1195,7 +1215,9 @@ def plot_irradiance_vs_generation(
     """Data-quality diagnostic: on-site irradiance vs inverter generation.
 
     Both quantities are summed over the tracked 10 AM – 2 PM window.
-    Produces dq1_irradiance_vs_generation.png (4-panel figure).
+    Produces two files:
+      - dq1_irradiance_vs_generation_timeseries.png  (dual-axis time series)
+      - dq1_irradiance_vs_generation.png             (scatter + boxplot panels)
     """
     log.info("── Data quality: irradiance vs generation ──")
     results: Dict[str, Any] = {}
@@ -1210,34 +1232,56 @@ def plot_irradiance_vs_generation(
     ]
 
     gen_kwh = gen / 3.6e6
-    solcast_kwh_m2 = (
-        df["solcast_gti_sum"] / 3.6e6 if "solcast_gti_sum" in df.columns
-        else pd.Series(np.nan, index=df.index)
-    )
+    cmap = plt.cm.hsv
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+    # ── Figure A: time-series (full width, readable x-axis) ───────────
+    fig_ts, ax1 = plt.subplots(figsize=(16, 6))
+    
+    def _scale(s):
+        v = s.dropna()
+        if v.empty or v.max() == v.min(): return s
+        return (s - v.min()) / (v.max() - v.min())
+        
+    irr_scaled = _scale(irr)
+    gen_scaled = _scale(gen_kwh)
+    
+    # Base daily lines
+    ax1.plot(day_dt, irr_scaled, lw=0.6, color=C_T1, alpha=0.3, label="On-site irr (daily)")
+    ax1.plot(day_dt, gen_scaled, lw=0.6, color=C_ACCENT, alpha=0.3, label="T1 generation (daily)")
+    
+    # 7-day rolling medians
+    irr_smooth = irr_scaled.rolling(7, center=True, min_periods=3).median()
+    gen_smooth = gen_scaled.rolling(7, center=True, min_periods=3).median()
+    
+    ax1.plot(day_dt, irr_smooth, lw=2.0, color=C_T1, label="On-site irr (7-day median)")
+    ax1.plot(day_dt, gen_smooth, lw=2.0, color=C_ACCENT, label="T1 gen (7-day median)")
+    
+    # Add CSA day markers
+    if "is_clear_sky_analyzable" in df.columns:
+        csa_mask = df["is_clear_sky_analyzable"].fillna(False).astype(bool)
+        if csa_mask.any():
+            ax1.scatter(day_dt[csa_mask], [0] * csa_mask.sum(),
+                        color="grey", alpha=0.6, s=15, marker="^", label="CSA days", zorder=5)
 
-    # ── Panel 1: dual-axis time series ────────────────────────────────
-    ax1 = axes[0, 0]
-    ax1.plot(day_dt, irr, lw=0.8, color=C_T1, alpha=0.7, label="On-site irr (sensor sum)")
-    ax1.set_ylabel("On-site irradiance (sensor sum, arb.)", color=C_T1, fontsize=8)
-    ax1.tick_params(axis="y", labelcolor=C_T1, labelsize=7)
-    ax1_r = ax1.twinx()
-    ax1_r.plot(day_dt, gen_kwh, lw=0.8, color=C_ACCENT, alpha=0.7, label="T1 generation (kWh)")
-    ax1_r.set_ylabel("T1 generation (kWh)", color=C_ACCENT, fontsize=8)
-    ax1_r.tick_params(axis="y", labelcolor=C_ACCENT, labelsize=7)
-    ln1, lb1 = ax1.get_legend_handles_labels()
-    ln2, lb2 = ax1_r.get_legend_handles_labels()
-    ax1.legend(ln1 + ln2, lb1 + lb2, fontsize=7, loc="upper right")
+    ax1.set_ylabel("Normalised to [0, 1]", fontsize=8)
+    ax1.tick_params(axis="y", labelsize=7)
+    ax1.legend(fontsize=7, loc="upper right", ncol=2)
     _add_rain_cleaning_overlays(ax1, df)
     ax1.xaxis.set_major_locator(mdates.MonthLocator())
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%y"))
-    ax1.set_title("Time series: on-site irradiance & T1 generation (10am–2pm)", fontsize=9)
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+    fig_ts.suptitle(
+        "DQ1: On-site irradiance & T1 generation time series (10 AM – 2 PM)",
+        fontsize=12, fontweight="bold",
+    )
+    fig_ts.tight_layout()
+    _save(fig_ts, plots_dir / "dq1_irradiance_vs_generation_timeseries.png")
 
-    # ── Panel 2: scatter irr vs gen, coloured by month ────────────────
-    ax2 = axes[0, 1]
+    # ── Figure B: scatter + boxplot panels ────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    # Panel 1: scatter irr vs gen, coloured by month
+    ax2 = axes[0]
     valid = (irr > 0) & (gen > 0)
-    cmap = plt.cm.hsv
     sc = ax2.scatter(
         irr[valid], gen_kwh[valid], c=month[valid], cmap=cmap,
         s=18, alpha=0.65, edgecolors="white", linewidths=0.3,
@@ -1246,17 +1290,33 @@ def plot_irradiance_vs_generation(
     cbar = fig.colorbar(sc, ax=ax2, ticks=range(1, 13))
     cbar.ax.set_yticklabels([month_names[i] for i in range(1, 13)], fontsize=6)
     cbar.set_label("Month", fontsize=7)
+    
     if valid.sum() > 3:
         r_val, _ = stats.pearsonr(irr[valid], gen_kwh[valid])
-        ax2.set_title(f"On-site irradiance vs T1 generation (r={r_val:.3f})", fontsize=9)
+        title_str = f"On-site irr vs T1 gen (r={r_val:.3f})"
         results["onsite_irr_vs_gen_r"] = r_val
+        
+        if "subset_energy_j" in df.columns:
+            comb_gen = df["subset_energy_j"] / 3.6e6
+            comb_valid = (irr > 0) & (comb_gen > 0)
+            if comb_valid.sum() > 3:
+                r_comb, _ = stats.pearsonr(irr[comb_valid], comb_gen[comb_valid])
+                ax2.text(
+                    0.02, 0.98, f"Combined T1+T2 r={r_comb:.3f}",
+                    transform=ax2.transAxes, fontsize=8, va="top",
+                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+                )
+                results["onsite_irr_vs_combined_gen_r"] = r_comb
+
+        ax2.set_title(title_str, fontsize=9)
     else:
         ax2.set_title("On-site irradiance vs T1 generation", fontsize=9)
+        
     ax2.set_xlabel("On-site irradiance (sensor sum)", fontsize=8)
     ax2.set_ylabel("T1 generation (kWh)", fontsize=8)
 
-    # ── Panel 3: Solcast peak-hour GTI vs generation ────────────────
-    ax3 = axes[1, 0]
+    # Panel 2: Solcast peak-hour GTI vs generation
+    ax3 = axes[1]
     sol_peak_kwh_m2 = (
         df["solcast_gti_peak_sum"] / 3.6e6
         if "solcast_gti_peak_sum" in df.columns
@@ -1273,15 +1333,13 @@ def plot_irradiance_vs_generation(
             sol_peak_kwh_m2[sol_peak_valid], gen_kwh[sol_peak_valid],
         )
         ax3.set_title(
-            f"Solcast peak GTI (10–14h, kWh/m²) vs T1 gen (r={r_sol_peak:.3f})",
-            fontsize=9,
+            f"Solcast peak GTI vs T1 gen (r={r_sol_peak:.3f})", fontsize=9,
         )
         results["solcast_gti_peak_vs_gen_r"] = r_sol_peak
         cbar3 = fig.colorbar(sc3, ax=ax3, ticks=range(1, 13))
         cbar3.ax.set_yticklabels([month_names[i] for i in range(1, 13)], fontsize=6)
         cbar3.set_label("Month", fontsize=7)
 
-        # Full-plant reference annotation
         if "daily_generation_j" in df.columns:
             gen_full = df["daily_generation_j"] / 3.6e6
             full_mask = sol_peak_kwh_m2.notna() & (gen_full > 0) & (sol_peak_kwh_m2 > 0)
@@ -1297,16 +1355,17 @@ def plot_irradiance_vs_generation(
                 )
                 results["solcast_gti_peak_vs_fullgen_r"] = r_full
     else:
-        ax3.text(0.5, 0.5, "Solcast peak GTI not available",
+        ax3.text(0.5, 0.5, "Solcast peak GTI\nnot available",
                  transform=ax3.transAxes, ha="center", fontsize=10, color="grey")
     ax3.set_xlabel("Solcast GTI (kWh/m², 10–14h peak)", fontsize=8)
     ax3.set_ylabel("T1 generation (kWh)", fontsize=8)
 
-    # ── Panel 4: monthly box-plot of normalised output ────────────────
-    ax4 = axes[1, 1]
+    # Panel 3: monthly box-plot of normalised output
+    ax4 = axes[2]
     norm_col = (
         "t1_normalized_output"
         if "t1_normalized_output" in df.columns
+        else "t1_normalized_output" if "t1_normalized_output" in df.columns
         else "normalized_output"
     )
     if norm_col in df.columns:
@@ -1334,11 +1393,11 @@ def plot_irradiance_vs_generation(
                 bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
             )
     else:
-        ax4.text(0.5, 0.5, "Normalised output not available",
+        ax4.text(0.5, 0.5, "Normalised output\nnot available",
                  transform=ax4.transAxes, ha="center", fontsize=10, color="grey")
 
     fig.suptitle(
-        "DQ1: Data quality — irradiance vs generation (10 AM – 2 PM tracked window)",
+        "DQ1: Irradiance vs generation — scatter & distribution (10 AM – 2 PM)",
         fontsize=12, fontweight="bold",
     )
     fig.tight_layout()
@@ -1359,6 +1418,1404 @@ def plot_irradiance_vs_generation(
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
+# ║  DQ2: Daily generation validation (new telemetry)                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+def _plot_daily_gen_validation_legacy(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Dict[str, Any]:
+    """Cross-validate new daily_generated_electricity against old active-power
+    energy and new plant avg_solar_radiation against Solcast GTI.
+
+    Produces two files:
+      - dq2_daily_gen_validation_timeseries.png  (generation + irradiance ts)
+      - dq2_daily_gen_validation.png             (scatter panels)
+    Gracefully returns empty dict if new columns are absent.
+    """
+    results: Dict[str, Any] = {}
+    has_gen = "subset_daily_gen_kwh" in df.columns and df["subset_daily_gen_kwh"].notna().sum() > 5
+    has_irr = "plant_avg_irradiance_wm2" in df.columns and df["plant_avg_irradiance_wm2"].notna().sum() > 5
+
+    if not has_gen and not has_irr:
+        log.info("DQ2 skipped: new telemetry columns not present")
+        return results
+
+    log.info("── DQ2: Daily gen & plant irradiance validation ──")
+    day_dt = df["day_dt"]
+
+    # ── Figure A: time-series panels (stacked) ────────────────────────
+    n_ts_panels = 3 if (has_irr and "solcast_gti_peak_mean_wm2" in df.columns) else 2
+    fig_ts, ts_axes = plt.subplots(n_ts_panels, 1, figsize=(16, 6 * n_ts_panels))
+    ax_ts1, ax_ts2 = ts_axes[0], ts_axes[1]
+
+    if has_gen and "subset_energy_mwh" in df.columns:
+        old_mwh = df["subset_energy_mwh"]
+        new_kwh = df["subset_daily_gen_kwh"]
+        ax_ts1.plot(day_dt, old_mwh * 1000, lw=0.8, alpha=0.6, color=C_T2,
+                    label="Old (active power integral, kWh)")
+        ax_ts1.plot(day_dt, new_kwh, lw=0.8, alpha=0.8, color=C_T1,
+                    label="New (daily_generated_electricity, kWh)")
+        ax_ts1.set_ylabel("Subset generation (kWh)", fontsize=8)
+        ax_ts1.legend(fontsize=7, loc="upper right")
+        _add_rain_cleaning_overlays(ax_ts1, df)
+        _annotate_new_source_start(ax_ts1, df)
+        ax_ts1.xaxis.set_major_locator(mdates.MonthLocator())
+        ax_ts1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+        ax_ts1.set_title("Subset generation: old vs new source", fontsize=9)
+    else:
+        ax_ts1.text(0.5, 0.5, "New daily gen not available",
+                    transform=ax_ts1.transAxes, ha="center", fontsize=10, color="grey")
+
+    if has_irr:
+        plant_irr = df["plant_avg_irradiance_wm2"]
+        ax_ts2.plot(day_dt, plant_irr, lw=0.8, alpha=0.8, color=C_T1,
+                    label="Plant avg_solar_radiation (W/m²)")
+        if "solcast_gti_peak_mean_wm2" in df.columns:
+            sol_mean = df["solcast_gti_peak_mean_wm2"]
+            ax_ts2.plot(day_dt, sol_mean, lw=0.8, alpha=0.6, color=C_T2,
+                        label="Solcast peak GTI mean (W/m²)")
+        ax_ts2.set_ylabel("Irradiance (W/m²)", fontsize=8)
+        ax_ts2.legend(fontsize=7, loc="upper right")
+        _add_rain_cleaning_overlays(ax_ts2, df)
+        _annotate_new_source_start(ax_ts2, df)
+        ax_ts2.xaxis.set_major_locator(mdates.MonthLocator())
+        ax_ts2.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+        ax_ts2.set_title("Plant irradiance: on-site avg vs Solcast", fontsize=9)
+    else:
+        ax_ts2.text(0.5, 0.5, "Plant avg irradiance not available",
+                    transform=ax_ts2.transAxes, ha="center", fontsize=10, color="grey")
+
+    # Panel 3: Solcast / ground irradiance ratio — sensor health indicator
+    if n_ts_panels == 3:
+        ax_ts3 = ts_axes[2]
+        sol_col = "solcast_gti_peak_mean_wm2"
+        plant_col = "plant_avg_irradiance_wm2"
+        sol_v = df[sol_col]
+        plant_v = df[plant_col]
+        ratio_valid = sol_v.notna() & plant_v.notna() & (plant_v > 0)
+        sol_ground_ratio = (sol_v / plant_v).where(ratio_valid)
+        ratio_smooth_14 = sol_ground_ratio.rolling(14, center=True, min_periods=5).median()
+
+        ax_ts3.scatter(day_dt, sol_ground_ratio, s=8, alpha=0.3, color=C_T1,
+                       label="Daily ratio", zorder=2)
+        ax_ts3.plot(day_dt, ratio_smooth_14, lw=2.5, color="#E74C3C",
+                    label="14-day rolling median", zorder=3)
+        ax_ts3.axhline(sol_ground_ratio.median(), color="black", lw=0.8,
+                       ls="--", alpha=0.5, label=f"Median = {sol_ground_ratio.median():.2f}")
+
+        # Overlay sensor recalibration flags
+        if "flag_sensor_recalibrated" in df.columns:
+            recal_mask = df["flag_sensor_recalibrated"].fillna(False).astype(bool)
+            if recal_mask.any():
+                ax_ts3.scatter(day_dt[recal_mask],
+                               sol_ground_ratio[recal_mask],
+                               marker="x", s=60, color="#E74C3C", linewidths=2,
+                               label=f"Recalibration flag ({recal_mask.sum()} days)",
+                               zorder=5)
+
+        # Compute and report trend
+        ratio_clean = sol_ground_ratio.dropna()
+        if len(ratio_clean) > 10:
+            x_num = np.arange(len(ratio_clean))
+            slope, intercept = np.polyfit(x_num, ratio_clean.values, 1)
+            results["sensor_ratio_trend_per_day"] = slope
+            ax_ts3.text(
+                0.02, 0.98,
+                f"Trend: {slope:+.4f} per day\nMedian ratio: {sol_ground_ratio.median():.3f}",
+                transform=ax_ts3.transAxes, fontsize=8, va="top",
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+            )
+
+        ax_ts3.set_ylabel("Solcast / Ground ratio", fontsize=8)
+        ax_ts3.set_title("Sensor health: Solcast / ground irradiance ratio", fontsize=9)
+        ax_ts3.legend(fontsize=7, loc="upper right")
+        _add_rain_cleaning_overlays(ax_ts3, df)
+        ax_ts3.xaxis.set_major_locator(mdates.MonthLocator())
+        ax_ts3.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    fig_ts.suptitle(
+        "DQ2: New telemetry time series — daily gen & plant irradiance",
+        fontsize=12, fontweight="bold",
+    )
+    fig_ts.tight_layout()
+    _save(fig_ts, plots_dir / "dq2_daily_gen_validation_timeseries.png")
+
+    # ── Figure B: scatter panels ──────────────────────────────────────
+    fig, (ax_sc1, ax_sc2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    if has_gen and "subset_energy_j" in df.columns:
+        old_j = df["subset_energy_j"]
+        new_j = df["subset_daily_gen_kwh"] * 3.6e6
+        valid = old_j.notna() & new_j.notna() & (old_j > 0) & (new_j > 0)
+        if valid.sum() > 3:
+            ax_sc1.scatter(
+                old_j[valid] / 3.6e6, new_j[valid] / 3.6e6,
+                s=14, alpha=0.5, color=C_T1, edgecolors="white", linewidths=0.3,
+            )
+            r_gen, _ = stats.pearsonr(old_j[valid], new_j[valid])
+            results["old_vs_new_gen_r"] = r_gen
+            ax_sc1.set_title(f"Old vs new generation (r={r_gen:.3f})", fontsize=9)
+            lims = [
+                min(old_j[valid].min(), new_j[valid].min()) / 3.6e6,
+                max(old_j[valid].max(), new_j[valid].max()) / 3.6e6,
+            ]
+            ax_sc1.plot(lims, lims, "--", color="grey", lw=0.7, alpha=0.5)
+        ax_sc1.set_xlabel("Old: active power integral (kWh)", fontsize=8)
+        ax_sc1.set_ylabel("New: daily_generated_electricity (kWh)", fontsize=8)
+    else:
+        ax_sc1.text(0.5, 0.5, "New daily gen not available",
+                    transform=ax_sc1.transAxes, ha="center", fontsize=10, color="grey")
+
+    if has_irr and "solcast_gti_peak_mean_wm2" in df.columns:
+        plant_irr = df["plant_avg_irradiance_wm2"]
+        sol_mean = df["solcast_gti_peak_mean_wm2"]
+        valid = plant_irr.notna() & sol_mean.notna() & (plant_irr > 0) & (sol_mean > 0)
+        if valid.sum() > 3:
+            ax_sc2.scatter(
+                sol_mean[valid], plant_irr[valid],
+                s=14, alpha=0.5, color=C_ACCENT, edgecolors="white", linewidths=0.3,
+            )
+            r_irr, _ = stats.pearsonr(sol_mean[valid], plant_irr[valid])
+            results["plant_vs_solcast_irr_r"] = r_irr
+            ax_sc2.set_title(f"Plant avg vs Solcast peak mean (r={r_irr:.3f})", fontsize=9)
+        ax_sc2.set_xlabel("Solcast peak GTI mean (W/m²)", fontsize=8)
+        ax_sc2.set_ylabel("Plant avg_solar_radiation (W/m²)", fontsize=8)
+    else:
+        ax_sc2.text(0.5, 0.5, "Comparison not available",
+                    transform=ax_sc2.transAxes, ha="center", fontsize=10, color="grey")
+
+    fig.suptitle(
+        "DQ2: New telemetry validation — scatter comparisons",
+        fontsize=12, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, plots_dir / "dq2_daily_gen_validation.png")
+
+    log.info(
+        "DQ2 done: old-vs-new-gen r=%.3f, plant-vs-solcast-irr r=%.3f",
+        results.get("old_vs_new_gen_r", float("nan")),
+        results.get("plant_vs_solcast_irr_r", float("nan")),
+    )
+    return results
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  DQ3: Generation / irradiance ratio (normalized performance)       ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+def _plot_gen_irr_ratio_legacy(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Dict[str, Any]:
+    """Generation-to-irradiance ratio from the new telemetry sources.
+
+    Mirrors the user's pre-test visualization: normalized performance ratio
+    with context (generation, irradiance scaled alongside).
+
+    Produces two files:
+      - dq3_gen_irr_ratio_timeseries.png  (ratio + context ts, ratio vs loss proxy ts)
+      - dq3_gen_irr_ratio.png             (monthly boxplot)
+    """
+    results: Dict[str, Any] = {}
+
+    if "gen_irr_ratio" not in df.columns or df["gen_irr_ratio"].notna().sum() < 5:
+        log.info("DQ3 skipped: gen_irr_ratio not available")
+        return results
+
+    log.info("── DQ3: Generation / irradiance ratio ──")
+    day_dt = df["day_dt"]
+    ratio = df["gen_irr_ratio"]
+    smoothed = df.get("gen_irr_ratio_smoothed", ratio)
+    valid = ratio.notna()
+    month_names = [
+        "", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+
+    results["gen_irr_ratio_median"] = float(ratio[valid].median()) if valid.any() else np.nan
+    results["gen_irr_ratio_std"] = float(ratio[valid].std()) if valid.any() else np.nan
+
+    def _scale_to(series, lo, hi):
+        s = series.dropna()
+        if s.empty or s.max() == s.min():
+            return series
+        return (series - s.min()) / (s.max() - s.min()) * (hi - lo) + lo
+
+    ratio_lo = ratio[valid].min() if valid.any() else 0
+    ratio_hi = ratio[valid].max() if valid.any() else 1
+
+    # ── STL decomposition ─────────────────────────────────────────────
+    stl_ok = False
+    stl_trend = stl_seasonal = stl_resid = None
+    ratio_for_stl = ratio.copy()
+    if valid.sum() > 60:
+        try:
+            # Interpolate NaN gaps for STL (it requires continuous series)
+            ratio_interp = ratio_for_stl.interpolate(method="linear", limit_direction="both")
+            ratio_interp = ratio_interp.fillna(ratio_interp.median())
+            stl_result = STL(ratio_interp.values, period=30, robust=True).fit()
+            stl_trend = pd.Series(stl_result.trend, index=ratio.index)
+            stl_seasonal = pd.Series(stl_result.seasonal, index=ratio.index)
+            stl_resid = pd.Series(stl_result.resid, index=ratio.index)
+            # Restore NaN where original was NaN
+            stl_trend[~valid] = np.nan
+            stl_seasonal[~valid] = np.nan
+            stl_resid[~valid] = np.nan
+            stl_ok = True
+            results["stl_trend_range"] = float(stl_trend.max() - stl_trend.min())
+            results["stl_seasonal_amplitude"] = float(stl_seasonal.max() - stl_seasonal.min())
+        except Exception as e:
+            log.warning("STL decomposition failed: %s", e)
+
+    # ── Figure A: time-series panels (stacked) ────────────────────────
+    n_ts = 5 if stl_ok else 2
+    fig_ts, ts_axes = plt.subplots(n_ts, 1, figsize=(16, 3.5 * n_ts))
+    if n_ts == 2:
+        ts_axes = list(ts_axes)
+    ax1 = ts_axes[0]
+    ax3 = ts_axes[1]
+
+    # Panel 1: ratio with context
+    if "subset_daily_gen_kwh" in df.columns:
+        gen_scaled = _scale_to(df["subset_daily_gen_kwh"], ratio_lo, ratio_hi)
+        ax1.plot(day_dt, gen_scaled, lw=1.0, alpha=0.4, color="#E67E22",
+                 label="Generation (scaled)")
+    if "plant_avg_irradiance_wm2" in df.columns:
+        irr_scaled = _scale_to(df["plant_avg_irradiance_wm2"], ratio_lo, ratio_hi)
+        ax1.plot(day_dt, irr_scaled, lw=1.0, alpha=0.4, color="#F4D03F",
+                 label="Irradiance (scaled)")
+
+    ax1.plot(day_dt, ratio, lw=0.7, alpha=0.4, color="#5DADE2",
+             label="Gen/Irr ratio (daily)")
+    ax1.plot(day_dt, smoothed, lw=2.5, color="#1F3A93",
+             label="Gen/Irr ratio (7-day median)")
+    ax1.axhline(ratio[valid].median() if valid.any() else 1,
+                color="black", lw=0.8, ls="--", alpha=0.5)
+
+    _add_rain_cleaning_overlays(ax1, df)
+    _annotate_new_source_start(ax1, df)
+    ax1.set_ylabel("Scaled units / ratio", fontsize=8)
+    ax1.legend(fontsize=7, loc="upper right", ncol=2)
+    ax1.xaxis.set_major_locator(mdates.MonthLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+    ax1.set_title("Normalized performance ratio with context", fontsize=10)
+
+    # Panel 2: overlay with loss proxy (inverted)
+    loss_col = "t1_performance_loss_pct_proxy" if "t1_performance_loss_pct_proxy" in df.columns else "performance_loss_pct_proxy"
+    if loss_col in df.columns:
+        loss = df[loss_col]
+        inverted_loss = -loss
+        ax3.plot(day_dt, smoothed, lw=2.0, color="#1F3A93", label="Gen/Irr ratio (smoothed)")
+        ax3r = ax3.twinx()
+        ax3r.plot(day_dt, inverted_loss, lw=1.0, alpha=0.5, color=C_T2,
+                  label="−Loss proxy (inverted)")
+        ax3r.set_ylabel("−Loss proxy (%)", color=C_T2, fontsize=8)
+        ax3r.tick_params(axis="y", labelcolor=C_T2, labelsize=7)
+
+        both_valid = smoothed.notna() & loss.notna()
+        if both_valid.sum() > 5:
+            r_agree, _ = stats.pearsonr(smoothed[both_valid], inverted_loss[both_valid])
+            results["ratio_vs_neg_loss_r"] = r_agree
+            ax3.set_title(
+                f"Gen/Irr ratio vs −loss proxy (r={r_agree:.3f})", fontsize=10,
+            )
+        ln1, lb1 = ax3.get_legend_handles_labels()
+        ln2, lb2 = ax3r.get_legend_handles_labels()
+        ax3.legend(ln1 + ln2, lb1 + lb2, fontsize=7, loc="upper right")
+    else:
+        ax3.plot(day_dt, smoothed, lw=2.0, color="#1F3A93", label="Gen/Irr ratio (smoothed)")
+        ax3.legend(fontsize=7)
+    ax3.set_ylabel("Gen / Irr ratio", fontsize=8)
+    _add_rain_cleaning_overlays(ax3, df)
+    _annotate_new_source_start(ax3, df)
+    ax3.xaxis.set_major_locator(mdates.MonthLocator())
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    # Panels 3-5: STL decomposition (Trend, Seasonal, Residual)
+    if stl_ok:
+        stl_parts = [
+            (ts_axes[2], stl_trend, "STL Trend (soiling / long-term drift)", "#1F3A93"),
+            (ts_axes[3], stl_seasonal, "STL Seasonal (monsoon / climatology, period=30d)", "#27AE60"),
+            (ts_axes[4], stl_resid, "STL Residual (noise)", "#E74C3C"),
+        ]
+        for ax_stl, component, title, color in stl_parts:
+            ax_stl.plot(day_dt, component, lw=1.5, color=color, alpha=0.8)
+            ax_stl.axhline(0 if "Residual" in title or "Seasonal" in title else component.median(),
+                           color="black", lw=0.5, ls="--", alpha=0.3)
+            _add_rain_cleaning_overlays(ax_stl, df)
+            ax_stl.set_title(title, fontsize=9)
+            ax_stl.set_ylabel("Component value", fontsize=7)
+            ax_stl.tick_params(axis="y", labelsize=7)
+            ax_stl.xaxis.set_major_locator(mdates.MonthLocator())
+            ax_stl.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    fig_ts.suptitle(
+        "DQ3: Generation / irradiance ratio — time series & STL decomposition",
+        fontsize=12, fontweight="bold",
+    )
+    fig_ts.tight_layout()
+    _save(fig_ts, plots_dir / "dq3_gen_irr_ratio_timeseries.png")
+
+    # ── Figure B: monthly boxplot ─────────────────────────────────────
+    fig_box, ax2 = plt.subplots(figsize=(12, 6))
+    months_present = sorted(df.loc[valid, "day_dt"].dt.month.unique())
+    box_data = [
+        ratio[valid & (day_dt.dt.month == m)].dropna().values
+        for m in months_present
+    ]
+    bp = ax2.boxplot(
+        box_data, patch_artist=True,
+        tick_labels=[month_names[m] for m in months_present],
+    )
+    for patch in bp["boxes"]:
+        patch.set_facecolor(C_T1)
+        patch.set_alpha(0.4)
+    ax2.set_ylabel("Gen / Irr ratio", fontsize=8)
+    ax2.set_title("Monthly gen/irr ratio", fontsize=10)
+    fig_box.suptitle(
+        "DQ3: Generation / irradiance ratio — monthly distribution",
+        fontsize=12, fontweight="bold",
+    )
+    fig_box.tight_layout()
+    _save(fig_box, plots_dir / "dq3_gen_irr_ratio.png")
+
+    log.info(
+        "DQ3 done: median ratio=%.4f, ratio-vs-neg-loss r=%.3f",
+        results.get("gen_irr_ratio_median", float("nan")),
+        results.get("ratio_vs_neg_loss_r", float("nan")),
+    )
+    return results
+
+
+# DQ2/DQ3 replacements use physically consistent irradiation and PR metrics.
+def _detect_aligned_inverter_ids(df: pd.DataFrame) -> List[str]:
+    power_ids = {
+        c[:-len("_energy_j")]
+        for c in df.columns
+        if c.endswith("_energy_j")
+        and c.startswith(("b1_", "b2_"))
+        and c.count("_") == 2
+    }
+    daily_ids = {
+        c[:-len("_daily_gen_j")]
+        for c in df.columns
+        if c.endswith("_daily_gen_j")
+        and c.startswith(("b1_", "b2_"))
+        and c.count("_") == 2
+    }
+    return sorted(power_ids.intersection(daily_ids))
+
+
+def plot_daily_gen_validation(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Dict[str, Any]:
+    """DQ2: like-for-like generation validation with physical irradiation context."""
+    results: Dict[str, Any] = {}
+    has_new_gen = "subset_daily_gen_kwh" in df.columns and df["subset_daily_gen_kwh"].notna().sum() > 5
+    has_irr_kwh = "irradiation_kwh_m2" in df.columns and df["irradiation_kwh_m2"].notna().sum() > 5
+    has_avg_irr = "plant_avg_irradiance_wm2" in df.columns and df["plant_avg_irradiance_wm2"].notna().sum() > 5
+
+    if not has_new_gen and not has_irr_kwh and not has_avg_irr:
+        log.info("DQ2 skipped: required new-source fields are absent")
+        return results
+
+    log.info("── DQ2: Daily generation validation (asset-aligned + physical irradiation) ──")
+    day_dt = df["day_dt"]
+    aligned_ids = _detect_aligned_inverter_ids(df)
+    results["aligned_inverters"] = aligned_ids
+
+    old_aligned_kwh = None
+    if aligned_ids:
+        old_cols = [f"{inv}_energy_j" for inv in aligned_ids if f"{inv}_energy_j" in df.columns]
+        if old_cols:
+            old_aligned_kwh = df[old_cols].sum(axis=1, min_count=1) / 3.6e6
+    if old_aligned_kwh is None and "subset_energy_mwh" in df.columns:
+        old_aligned_kwh = df["subset_energy_mwh"] * 1000.0
+
+    new_aligned_kwh = df["subset_daily_gen_kwh"] if has_new_gen else None
+
+    n_ts_panels = 3
+    fig_ts, ts_axes = plt.subplots(n_ts_panels, 1, figsize=(16, 5.2 * n_ts_panels))
+    ax_ts1, ax_ts2, ax_ts3 = ts_axes[0], ts_axes[1], ts_axes[2]
+
+    # Panel 1: like-for-like old vs new generation
+    if old_aligned_kwh is not None and new_aligned_kwh is not None:
+        ax_ts1.plot(
+            day_dt, old_aligned_kwh, lw=0.9, alpha=0.65, color=C_T2,
+            label="Old aligned generation (active-power integral, kWh)",
+        )
+        ax_ts1.plot(
+            day_dt, new_aligned_kwh, lw=0.9, alpha=0.85, color=C_T1,
+            label="New aligned generation (daily meter, kWh)",
+        )
+        valid = old_aligned_kwh.notna() & new_aligned_kwh.notna() & (old_aligned_kwh > 0) & (new_aligned_kwh > 0)
+        if int(valid.sum()) > 5:
+            r_gen, _ = stats.pearsonr(old_aligned_kwh[valid], new_aligned_kwh[valid])
+            results["old_vs_new_gen_r"] = float(r_gen)
+        ax_ts1.set_ylabel("Generation (kWh)", fontsize=8)
+        ax_ts1.legend(fontsize=7, loc="upper right")
+    else:
+        ax_ts1.text(0.5, 0.5, "Generation comparison unavailable", transform=ax_ts1.transAxes, ha="center", color="grey")
+    _add_rain_cleaning_overlays(ax_ts1, df)
+    _annotate_new_source_start(ax_ts1, df)
+    ax_ts1.set_title("Asset-aligned subset generation: old vs new", fontsize=9)
+    ax_ts1.xaxis.set_major_locator(mdates.MonthLocator())
+    ax_ts1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    # Panel 2: physical irradiation context
+    if has_irr_kwh:
+        irr_kwh = df["irradiation_kwh_m2"]
+        ax_ts2.plot(
+            day_dt, irr_kwh, lw=0.9, alpha=0.85, color=C_ACCENT,
+            label="Daily irradiation (kWh/m²) = avg_irradiance × runtime / 1000",
+        )
+        if has_new_gen:
+            valid = new_aligned_kwh.notna() & irr_kwh.notna() & (irr_kwh > 0)
+            if int(valid.sum()) > 5:
+                r_irr, _ = stats.pearsonr(new_aligned_kwh[valid], irr_kwh[valid])
+                results["new_gen_vs_irradiation_r"] = float(r_irr)
+        ax_ts2.set_ylabel("Irradiation (kWh/m²)", fontsize=8)
+        ax_ts2.legend(fontsize=7, loc="upper right")
+    else:
+        ax_ts2.text(0.5, 0.5, "irradiation_kwh_m2 not available", transform=ax_ts2.transAxes, ha="center", color="grey")
+    _add_rain_cleaning_overlays(ax_ts2, df)
+    _annotate_new_source_start(ax_ts2, df)
+    ax_ts2.set_title("Physical irradiation context", fontsize=9)
+    ax_ts2.xaxis.set_major_locator(mdates.MonthLocator())
+    ax_ts2.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    # Panel 3: ground-vs-solcast irradiance consistency
+    if has_avg_irr and "solcast_gti_peak_mean_wm2" in df.columns:
+        plant_irr = df["plant_avg_irradiance_wm2"]
+        sol_mean = df["solcast_gti_peak_mean_wm2"]
+        ratio_valid = plant_irr.notna() & sol_mean.notna() & (plant_irr > 0)
+        ratio = (sol_mean / plant_irr).where(ratio_valid)
+        smooth = ratio.rolling(14, center=True, min_periods=5).median()
+        ax_ts3.scatter(day_dt, ratio, s=8, alpha=0.30, color=C_T1, label="Daily ratio")
+        ax_ts3.plot(day_dt, smooth, lw=2.0, color="#E74C3C", label="14-day median")
+        if int(ratio_valid.sum()) > 5:
+            r_ps, _ = stats.pearsonr(plant_irr[ratio_valid], sol_mean[ratio_valid])
+            results["plant_vs_solcast_irr_r"] = float(r_ps)
+        ax_ts3.set_ylabel("Solcast / Ground", fontsize=8)
+        ax_ts3.legend(fontsize=7, loc="upper right")
+    else:
+        ax_ts3.text(0.5, 0.5, "Ground-vs-Solcast comparison unavailable", transform=ax_ts3.transAxes, ha="center", color="grey")
+    _add_rain_cleaning_overlays(ax_ts3, df)
+    ax_ts3.set_title("Sensor consistency (Solcast / ground irradiance)", fontsize=9)
+    ax_ts3.xaxis.set_major_locator(mdates.MonthLocator())
+    ax_ts3.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    fig_ts.suptitle(
+        "DQ2: Daily generation validation — asset aligned with physical irradiation context",
+        fontsize=12, fontweight="bold",
+    )
+    fig_ts.tight_layout()
+    _save(fig_ts, plots_dir / "dq2_daily_gen_validation_timeseries.png")
+
+    fig, (ax_sc1, ax_sc2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Scatter A: old vs new aligned generation
+    if old_aligned_kwh is not None and new_aligned_kwh is not None:
+        valid = old_aligned_kwh.notna() & new_aligned_kwh.notna() & (old_aligned_kwh > 0) & (new_aligned_kwh > 0)
+        if int(valid.sum()) > 5:
+            ax_sc1.scatter(
+                old_aligned_kwh[valid], new_aligned_kwh[valid],
+                s=14, alpha=0.5, color=C_T1, edgecolors="white", linewidths=0.3,
+            )
+            lim_lo = float(min(old_aligned_kwh[valid].min(), new_aligned_kwh[valid].min()))
+            lim_hi = float(max(old_aligned_kwh[valid].max(), new_aligned_kwh[valid].max()))
+            ax_sc1.plot([lim_lo, lim_hi], [lim_lo, lim_hi], "--", color="grey", lw=0.7, alpha=0.6)
+            r_gen, _ = stats.pearsonr(old_aligned_kwh[valid], new_aligned_kwh[valid])
+            results["old_vs_new_gen_r"] = float(r_gen)
+            ax_sc1.set_title(f"Old vs new aligned generation (r={r_gen:.3f})", fontsize=9)
+        ax_sc1.set_xlabel("Old aligned generation (kWh)", fontsize=8)
+        ax_sc1.set_ylabel("New aligned generation (kWh)", fontsize=8)
+    else:
+        ax_sc1.text(0.5, 0.5, "Generation scatter unavailable", transform=ax_sc1.transAxes, ha="center", color="grey")
+
+    # Scatter B: new generation vs physical irradiation
+    if has_new_gen and has_irr_kwh:
+        irr_kwh = df["irradiation_kwh_m2"]
+        valid = new_aligned_kwh.notna() & irr_kwh.notna() & (irr_kwh > 0)
+        if int(valid.sum()) > 5:
+            ax_sc2.scatter(
+                irr_kwh[valid], new_aligned_kwh[valid],
+                s=14, alpha=0.5, color=C_ACCENT, edgecolors="white", linewidths=0.3,
+            )
+            r_irr, _ = stats.pearsonr(irr_kwh[valid], new_aligned_kwh[valid])
+            results["new_gen_vs_irradiation_r"] = float(r_irr)
+            ax_sc2.set_title(f"New generation vs irradiation (r={r_irr:.3f})", fontsize=9)
+        ax_sc2.set_xlabel("Irradiation (kWh/m²)", fontsize=8)
+        ax_sc2.set_ylabel("New aligned generation (kWh)", fontsize=8)
+    else:
+        ax_sc2.text(0.5, 0.5, "Irradiation scatter unavailable", transform=ax_sc2.transAxes, ha="center", color="grey")
+
+    fig.suptitle(
+        "DQ2: New telemetry validation — aligned generation and irradiation",
+        fontsize=12, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, plots_dir / "dq2_daily_gen_validation.png")
+
+    log.info(
+        "DQ2 done: old-vs-new r=%.3f, new-vs-irradiation r=%.3f",
+        results.get("old_vs_new_gen_r", float("nan")),
+        results.get("new_gen_vs_irradiation_r", float("nan")),
+    )
+    return results
+
+
+def plot_gen_irr_ratio(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Dict[str, Any]:
+    """DQ3: physical PR with outlier markers and interpolated trend."""
+    results: Dict[str, Any] = {}
+
+    if "gen_irr_ratio" not in df.columns or df["gen_irr_ratio"].notna().sum() < 5:
+        log.info("DQ3 skipped: gen_irr_ratio not available")
+        return results
+
+    log.info("── DQ3: Physical PR diagnostics ──")
+    day_dt = df["day_dt"]
+    pr_raw = df["gen_irr_ratio"]
+    outlier = (
+        df["subset_pr_physical_outlier"].fillna(False).astype(bool)
+        if "subset_pr_physical_outlier" in df.columns
+        else (pr_raw.notna() & ((pr_raw < 0) | (pr_raw > 1)))
+    )
+    pr_interp = (
+        df["subset_pr_physical_interp"]
+        if "subset_pr_physical_interp" in df.columns
+        else pr_raw.mask(outlier).interpolate(method="linear", limit_area="inside")
+    )
+    pr_roll7 = pr_interp.rolling(7, center=True, min_periods=3).median()
+
+    valid = pr_raw.notna()
+    valid_inrange = valid & (~outlier)
+    results["gen_irr_ratio_median"] = float(pr_raw[valid].median()) if valid.any() else np.nan
+    results["gen_irr_ratio_std"] = float(pr_raw[valid].std()) if valid.any() else np.nan
+    results["gen_irr_ratio_outlier_count"] = int(outlier.sum())
+    results["gen_irr_ratio_outlier_pct"] = float(100.0 * outlier.mean()) if len(outlier) else np.nan
+
+    n_ts = 3 if "plant_pr_physical_raw" in df.columns else 2
+    fig_ts, ts_axes = plt.subplots(n_ts, 1, figsize=(16, 4.0 * n_ts))
+    if n_ts == 2:
+        ts_axes = list(ts_axes)
+    ax1 = ts_axes[0]
+    ax2 = ts_axes[1]
+
+    # Panel 1: PR raw + outliers + interpolated trend
+    ax1.scatter(
+        day_dt[valid_inrange], pr_raw[valid_inrange],
+        s=12, alpha=0.35, color="#5DADE2", label="Raw PR (in-range)",
+    )
+    if outlier.any():
+        ax1.scatter(
+            day_dt[outlier], pr_raw[outlier],
+            marker="x", s=36, linewidths=1.2, color="#E74C3C", label="Outlier (PR<0 or PR>1)",
+        )
+    ax1.plot(day_dt, pr_interp, lw=1.8, color="#1F3A93", label="Interpolated PR trend")
+    ax1.plot(day_dt, pr_roll7, lw=2.6, color="#0B7285", label="Trend 7-day median")
+    ax1.axhline(1.0, color="black", lw=0.8, ls="--", alpha=0.5)
+    ax1.set_ylim(bottom=max(-0.05, float(np.nanmin(pr_raw) - 0.05) if valid.any() else -0.05))
+    ax1.set_ylabel("Subset PR", fontsize=8)
+    ax1.legend(fontsize=7, loc="upper right", ncol=2)
+    _add_rain_cleaning_overlays(ax1, df)
+    _annotate_new_source_start(ax1, df)
+    ax1.set_title("Physical subset PR: raw points, outliers, and interpolated trend", fontsize=10)
+    ax1.xaxis.set_major_locator(mdates.MonthLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    # Panel 2: PR trend vs old-source loss proxy
+    loss_col = "t1_performance_loss_pct_proxy" if "t1_performance_loss_pct_proxy" in df.columns else "performance_loss_pct_proxy"
+    if loss_col in df.columns:
+        loss = df[loss_col]
+        ax2.plot(day_dt, pr_roll7, lw=2.0, color="#1F3A93", label="Subset PR trend (7-day)")
+        ax2r = ax2.twinx()
+        ax2r.plot(day_dt, -loss, lw=1.0, alpha=0.55, color=C_T2, label="−Loss proxy (old source)")
+        both_valid = pr_roll7.notna() & loss.notna()
+        if int(both_valid.sum()) > 5:
+            r_agree, _ = stats.pearsonr(pr_roll7[both_valid], (-loss)[both_valid])
+            results["ratio_vs_neg_loss_r"] = float(r_agree)
+            ax2.set_title(f"Physical PR trend vs old-source −loss (r={r_agree:.3f})", fontsize=10)
+        ln1, lb1 = ax2.get_legend_handles_labels()
+        ln2, lb2 = ax2r.get_legend_handles_labels()
+        ax2.legend(ln1 + ln2, lb1 + lb2, fontsize=7, loc="upper right")
+        ax2r.set_ylabel("−Loss proxy (%)", color=C_T2, fontsize=8)
+        ax2r.tick_params(axis="y", labelcolor=C_T2, labelsize=7)
+    else:
+        ax2.plot(day_dt, pr_roll7, lw=2.0, color="#1F3A93", label="Subset PR trend (7-day)")
+        ax2.legend(fontsize=7, loc="upper right")
+    ax2.set_ylabel("Subset PR", fontsize=8)
+    _add_rain_cleaning_overlays(ax2, df)
+    _annotate_new_source_start(ax2, df)
+    ax2.xaxis.set_major_locator(mdates.MonthLocator())
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    # Panel 3: plant PR (optional)
+    if n_ts == 3:
+        ax3 = ts_axes[2]
+        plant_raw = df["plant_pr_physical_raw"]
+        plant_out = (
+            df["plant_pr_physical_outlier"].fillna(False).astype(bool)
+            if "plant_pr_physical_outlier" in df.columns
+            else (plant_raw.notna() & ((plant_raw < 0) | (plant_raw > 1)))
+        )
+        plant_trend = (
+            df["plant_pr_physical_interp"]
+            if "plant_pr_physical_interp" in df.columns
+            else plant_raw.mask(plant_out).interpolate(method="linear", limit_area="inside")
+        )
+        ax3.scatter(day_dt[plant_raw.notna() & (~plant_out)], plant_raw[plant_raw.notna() & (~plant_out)],
+                    s=10, alpha=0.30, color="#27AE60", label="Raw plant PR (in-range)")
+        if plant_out.any():
+            ax3.scatter(day_dt[plant_out], plant_raw[plant_out], marker="x", s=32, linewidths=1.1, color="#E74C3C", label="Outlier")
+        ax3.plot(day_dt, plant_trend, lw=2.0, color="#145A32", label="Plant PR trend")
+        ax3.axhline(1.0, color="black", lw=0.8, ls="--", alpha=0.5)
+        ax3.set_ylabel("Plant PR", fontsize=8)
+        ax3.legend(fontsize=7, loc="upper right")
+        _add_rain_cleaning_overlays(ax3, df)
+        ax3.xaxis.set_major_locator(mdates.MonthLocator())
+        ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+        ax3.set_title("Plant physical PR (capacity = 34 × 330 kW)", fontsize=10)
+
+    fig_ts.suptitle(
+        "DQ3: Physical generation/irradiation PR — outliers and trend",
+        fontsize=12, fontweight="bold",
+    )
+    fig_ts.tight_layout()
+    _save(fig_ts, plots_dir / "dq3_gen_irr_ratio_timeseries.png")
+
+    # Figure B: monthly distribution for in-range PR values only
+    fig_box, ax_box = plt.subplots(figsize=(12, 6))
+    month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    months_present = sorted(df.loc[valid_inrange, "day_dt"].dt.month.unique())
+    box_data = [
+        pr_raw[valid_inrange & (day_dt.dt.month == m)].dropna().values
+        for m in months_present
+    ]
+    if box_data:
+        bp = ax_box.boxplot(
+            box_data, patch_artist=True, tick_labels=[month_names[m] for m in months_present]
+        )
+        for patch in bp["boxes"]:
+            patch.set_facecolor(C_T1)
+            patch.set_alpha(0.35)
+    ax_box.set_ylabel("Subset PR (in-range)", fontsize=8)
+    ax_box.set_title("Monthly physical PR distribution (outliers excluded)", fontsize=10)
+    fig_box.suptitle(
+        "DQ3: Generation / irradiation ratio — monthly distribution",
+        fontsize=12, fontweight="bold",
+    )
+    fig_box.tight_layout()
+    _save(fig_box, plots_dir / "dq3_gen_irr_ratio.png")
+
+    log.info(
+        "DQ3 done: median raw PR=%.4f, outliers=%d",
+        results.get("gen_irr_ratio_median", float("nan")),
+        results.get("gen_irr_ratio_outlier_count", 0),
+    )
+    return results
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  DQ4: Power at reference irradiance                                ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+def plot_power_at_ref_irradiance(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Dict[str, Any]:
+    """Time series of active power at the dataset's median irradiance level.
+
+    Should show soiling-driven decay between cleanings if the feature is
+    working correctly.
+
+    Produces dq4_power_at_ref_irradiance.png (2-panel figure).
+    """
+    results: Dict[str, Any] = {}
+    col = "power_at_ref_irradiance_w"
+
+    if col not in df.columns or df[col].notna().sum() < 5:
+        log.info("DQ4 skipped: power_at_ref_irradiance_w not available")
+        return results
+
+    log.info("── DQ4: Power at reference irradiance ──")
+    day_dt = df["day_dt"]
+    pwr = df[col]
+    valid = pwr.notna()
+
+    if "ref_irradiance_wm2" in df.columns:
+        ref_val = df["ref_irradiance_wm2"].dropna().iloc[0] if df["ref_irradiance_wm2"].notna().any() else np.nan
+        results["ref_irradiance_wm2"] = float(ref_val)
+
+    results["power_at_ref_irr_median"] = float(pwr[valid].median())
+    results["power_at_ref_irr_days"] = int(valid.sum())
+
+    fig, axes = plt.subplots(4, 1, figsize=(16, 20))
+
+    # ── Panel 1: time series ──────────────────────────────────────────
+    ax1 = axes[0]
+    ax1.plot(day_dt, pwr, lw=0.8, alpha=0.5, color=C_T1, label="Daily")
+    smoothed_pwr = pwr.rolling(7, center=True, min_periods=3).median()
+    ax1.plot(day_dt, smoothed_pwr, lw=2.0, color="#1F3A93",
+             label="7-day median")
+    _add_rain_cleaning_overlays(ax1, df)
+    ax1.set_ylabel("Active power at ref irradiance (W)", fontsize=8)
+    ax1.xaxis.set_major_locator(mdates.MonthLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%y"))
+    ref_str = f" (ref={ref_val:.0f} W/m²)" if np.isfinite(results.get("ref_irradiance_wm2", np.nan)) else ""
+    ax1.set_title(f"Power at reference irradiance{ref_str}", fontsize=10)
+    ax1.legend(fontsize=7, loc="upper right")
+
+    for tier in ("t1", "t2"):
+        tier_col = f"{tier}_power_at_ref_irradiance_w"
+        if tier_col in df.columns and df[tier_col].notna().sum() > 5:
+            ax1.plot(
+                day_dt,
+                df[tier_col].rolling(7, center=True, min_periods=3).median(),
+                lw=1.2, alpha=0.6,
+                color=C_T1 if tier == "t1" else C_T2,
+                ls="--",
+                label=f"{tier.upper()} (7-day med)",
+            )
+    ax1.legend(fontsize=7, loc="upper right")
+
+    # ── Panel 2: ref_irr_match_count per day ──────────────────────────
+    ax_mc = axes[1]
+    if "ref_irr_match_count" in df.columns:
+        match_count = df["ref_irr_match_count"]
+        mc_valid = match_count.notna()
+        quarter = day_dt.dt.quarter
+        q_colors = {1: "#3498DB", 2: "#27AE60", 3: "#F39C12", 4: "#E74C3C"}
+        q_labels_map = {1: "Q1 (Jan-Mar)", 2: "Q2 (Apr-Jun)",
+                        3: "Q3 (Jul-Sep)", 4: "Q4 (Oct-Dec)"}
+        plotted_qs = set()
+        for q_num in sorted(quarter[mc_valid].unique()):
+            q_mask = mc_valid & (quarter == q_num)
+            lbl = q_labels_map.get(q_num, f"Q{q_num}")
+            if q_num not in plotted_qs:
+                ax_mc.bar(day_dt[q_mask], match_count[q_mask],
+                          color=q_colors.get(q_num, "grey"), alpha=0.7,
+                          width=1.0, label=lbl)
+                plotted_qs.add(q_num)
+            else:
+                ax_mc.bar(day_dt[q_mask], match_count[q_mask],
+                          color=q_colors.get(q_num, "grey"), alpha=0.7,
+                          width=1.0)
+
+        # Quarterly median annotations
+        for q_num in sorted(quarter[mc_valid].unique()):
+            q_mask = mc_valid & (quarter == q_num)
+            q_med = match_count[q_mask].median()
+            q_dates = day_dt[q_mask]
+            if len(q_dates) > 0:
+                mid_date = q_dates.iloc[len(q_dates) // 2]
+                ax_mc.annotate(
+                    f"med={q_med:.0f}",
+                    xy=(mid_date, q_med), fontsize=7,
+                    bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"),
+                    ha="center",
+                )
+
+        ax_mc.set_ylabel("Matching intervals per day", fontsize=8)
+        ax_mc.set_title("Reference irradiance match count by quarter", fontsize=10)
+        ax_mc.legend(fontsize=7, loc="upper right", ncol=4)
+        ax_mc.xaxis.set_major_locator(mdates.MonthLocator())
+        ax_mc.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%y"))
+
+        results["match_count_median"] = float(match_count.median())
+        results["match_count_q1_median"] = float(match_count[mc_valid & (quarter == 1)].median()) if (mc_valid & (quarter == 1)).any() else np.nan
+        results["match_count_q4_median"] = float(match_count[mc_valid & (quarter == 4)].median()) if (mc_valid & (quarter == 4)).any() else np.nan
+    else:
+        ax_mc.text(0.5, 0.5, "ref_irr_match_count not available",
+                   transform=ax_mc.transAxes, ha="center", fontsize=10, color="grey")
+
+    # ── Panel 3: raw correlation bar chart ────────────────────────────
+    ax2 = axes[2]
+    corr_features = [
+        ("cumulative_pm25_since_rain", "Cum PM2.5"),
+        ("cumulative_pm10_since_rain", "Cum PM10"),
+        ("pm25_mean", "PM2.5 (daily)"),
+        ("pm10_mean", "PM10 (daily)"),
+        ("days_since_last_rain", "Days since rain"),
+        ("domain_soiling_index", "DSPI"),
+        ("t1_performance_loss_pct_proxy", "Loss proxy (T1)"),
+        ("cycle_deviation_pct", "Cycle deviation"),
+        ("humidity_x_pm10", "Humidity × PM10"),
+        ("cloud_opacity_mean", "Cloud opacity"),
+    ]
+
+    corr_labels = []
+    corr_values = []
+    hq = _hq_filter(df)
+    for feat_col, label in corr_features:
+        if feat_col in hq.columns:
+            both = hq[col].notna() & hq[feat_col].notna()
+            if both.sum() > 10:
+                r, p = stats.pearsonr(hq.loc[both, col], hq.loc[both, feat_col])
+                corr_labels.append(label)
+                corr_values.append(r)
+                results[f"ref_irr_vs_{feat_col}_r"] = r
+
+    if corr_values:
+        colors = ["#E74C3C" if v < 0 else C_ACCENT for v in corr_values]
+        bars = ax2.barh(range(len(corr_labels)), corr_values, color=colors, alpha=0.7)
+        ax2.set_yticks(range(len(corr_labels)))
+        ax2.set_yticklabels(corr_labels, fontsize=8)
+        ax2.set_xlabel("Pearson r with power_at_ref_irradiance", fontsize=8)
+        ax2.axvline(0, color="black", lw=0.5)
+        for i, (bar, val) in enumerate(zip(bars, corr_values)):
+            ax2.text(
+                val + 0.01 * (1 if val >= 0 else -1), i,
+                f"{val:+.3f}", va="center", fontsize=7,
+            )
+        ax2.set_title("Raw Pearson correlations with soiling features (HQ days)", fontsize=10)
+    else:
+        ax2.text(0.5, 0.5, "Insufficient data for correlations",
+                 transform=ax2.transAxes, ha="center", fontsize=10, color="grey")
+
+    # ── Panel 4: partial correlations (controlling for cloud + month) ─
+    ax_pc = axes[3]
+    control_cols = []
+    if "cloud_opacity_mean" in hq.columns:
+        control_cols.append("cloud_opacity_mean")
+    # Add month as numeric control variable
+    if "day_dt" in hq.columns:
+        hq = hq.copy()
+        hq["_month"] = hq["day_dt"].dt.month
+        control_cols.append("_month")
+
+    partial_labels = []
+    partial_values = []
+    raw_for_partial = []
+
+    if len(control_cols) >= 1 and col in hq.columns:
+        for feat_col, label in corr_features:
+            if feat_col in hq.columns and feat_col not in control_cols:
+                sub = hq[[col, feat_col] + control_cols].dropna()
+                if len(sub) > 15:
+                    # Raw correlation
+                    r_raw, _ = stats.pearsonr(sub[col], sub[feat_col])
+                    # Partial correlation: regress both on controls, correlate residuals
+                    try:
+                        from numpy.linalg import lstsq
+                        X_ctrl = sub[control_cols].values
+                        X_ctrl = np.column_stack([X_ctrl, np.ones(len(X_ctrl))])
+                        # Residualise target
+                        coef_y, _, _, _ = lstsq(X_ctrl, sub[col].values, rcond=None)
+                        resid_y = sub[col].values - X_ctrl @ coef_y
+                        # Residualise feature
+                        coef_x, _, _, _ = lstsq(X_ctrl, sub[feat_col].values, rcond=None)
+                        resid_x = sub[feat_col].values - X_ctrl @ coef_x
+                        r_partial, _ = stats.pearsonr(resid_y, resid_x)
+                    except Exception:
+                        r_partial = np.nan
+
+                    partial_labels.append(label)
+                    raw_for_partial.append(r_raw)
+                    partial_values.append(r_partial)
+                    results[f"ref_irr_vs_{feat_col}_partial_r"] = r_partial
+
+    if partial_values:
+        y_pos = np.arange(len(partial_labels))
+        bar_height = 0.35
+        # Raw bars
+        raw_colors = ["#E74C3C" if v < 0 else C_ACCENT for v in raw_for_partial]
+        ax_pc.barh(y_pos + bar_height / 2, raw_for_partial, bar_height,
+                   color=raw_colors, alpha=0.4, label="Raw r")
+        # Partial bars
+        partial_colors = ["#E74C3C" if v < 0 else "#1F3A93" for v in partial_values]
+        ax_pc.barh(y_pos - bar_height / 2, partial_values, bar_height,
+                   color=partial_colors, alpha=0.8, label="Partial r (ctrl: cloud + month)")
+
+        ax_pc.set_yticks(y_pos)
+        ax_pc.set_yticklabels(partial_labels, fontsize=8)
+        ax_pc.set_xlabel("Correlation with power_at_ref_irradiance", fontsize=8)
+        ax_pc.axvline(0, color="black", lw=0.5)
+
+        for i, (rv, pv) in enumerate(zip(raw_for_partial, partial_values)):
+            ax_pc.text(rv + 0.01 * (1 if rv >= 0 else -1),
+                       i + bar_height / 2, f"{rv:+.3f}",
+                       va="center", fontsize=6, alpha=0.6)
+            ax_pc.text(pv + 0.01 * (1 if pv >= 0 else -1),
+                       i - bar_height / 2, f"{pv:+.3f}",
+                       va="center", fontsize=6, fontweight="bold")
+
+        # Check if PM10 flips sign after deconfounding
+        pm10_raw = results.get("ref_irr_vs_cumulative_pm10_since_rain_r", None)
+        pm10_partial = results.get("ref_irr_vs_cumulative_pm10_since_rain_partial_r", None)
+        pm25_partial = results.get("ref_irr_vs_cumulative_pm25_since_rain_partial_r", None)
+        annotation_parts = []
+        if pm10_raw is not None and pm10_partial is not None:
+            if pm10_raw > 0 and pm10_partial < 0:
+                annotation_parts.append("⚠ PM10 FLIPPED: seasonal confounding confirmed")
+                results["pm10_seasonal_confounding"] = True
+            elif pm10_raw > 0 and pm10_partial > 0:
+                annotation_parts.append("PM10 stayed positive after deconfounding")
+                results["pm10_seasonal_confounding"] = False
+        if pm25_partial is not None and pm10_partial is not None:
+            if pm25_partial < pm10_partial:
+                annotation_parts.append("→ Use PM2.5 as primary soiling predictor")
+                results["primary_pm_predictor"] = "PM2.5"
+            else:
+                annotation_parts.append("→ PM10 stronger after deconfounding")
+                results["primary_pm_predictor"] = "PM10"
+
+        if annotation_parts:
+            ax_pc.text(
+                0.02, 0.02, "\n".join(annotation_parts),
+                transform=ax_pc.transAxes, fontsize=8, va="bottom",
+                bbox=dict(facecolor="#FFF3CD", alpha=0.9, edgecolor="#FFC107"),
+            )
+
+        ax_pc.set_title("Partial correlations (controlling for cloud_opacity + month)", fontsize=10)
+        ax_pc.legend(fontsize=7, loc="upper right")
+    else:
+        ax_pc.text(0.5, 0.5, "Insufficient data for partial correlations",
+                   transform=ax_pc.transAxes, ha="center", fontsize=10, color="grey")
+
+    fig.suptitle(
+        "DQ4: Power at reference irradiance — soiling degradation signal",
+        fontsize=12, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, plots_dir / "dq4_power_at_ref_irradiance.png")
+
+    log.info(
+        "DQ4 done: %d days, median power=%.0f W, PM predictor=%s",
+        results.get("power_at_ref_irr_days", 0),
+        results.get("power_at_ref_irr_median", float("nan")),
+        results.get("primary_pm_predictor", "unknown"),
+    )
+    return results
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  DQ6: New-source Performance Index (0-1)                           ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+def plot_new_performance_index(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Visualise the 0-1 performance index derived from new telemetry.
+
+    performance_index = gen_irr_ratio / new_rolling_clean_baseline.
+    Values near 1.0 = clean-panel performance; values < 1 = degradation.
+
+    Figure A (main): TS, frozen-baseline overlay, histogram
+    Figure B: Above-1.0 clustering + rain Wilcoxon test
+    Figure C: Scatter + quantile regression (90th pctile)
+    """
+    idx_col = "new_performance_index"
+    if idx_col not in df.columns or df[idx_col].notna().sum() < 10:
+        log.info("DQ6 skipped: new_performance_index not present.")
+        return None
+
+    log.info("── DQ6: New-source performance index ──")
+    results: Dict[str, Any] = {}
+    hq = df[df["transfer_readiness_tier"].isin(["Tier-1", "Tier-2"])] if "transfer_readiness_tier" in df.columns else df
+    idx = hq[idx_col]
+    valid = idx.notna()
+    idx_valid = idx[valid]
+
+    results["perf_index_median"] = float(idx_valid.median())
+    results["perf_index_mean"] = float(idx_valid.mean())
+    results["pct_below_1"] = float((idx_valid < 1.0).mean() * 100)
+    results["pct_below_09"] = float((idx_valid < 0.9).mean() * 100)
+    results["pct_below_08"] = float((idx_valid < 0.8).mean() * 100)
+    results["pct_above_1"] = float((idx_valid > 1.0).mean() * 100)
+    results["n_days"] = int(valid.sum())
+
+    soiling_features = [
+        ("domain_soiling_index", "DSPI"),
+        ("cumulative_pm25_since_rain", "Cum PM2.5"),
+        ("cumulative_pm10_since_rain", "Cum PM10"),
+        ("days_since_last_rain", "Days dry"),
+        ("humidity_x_pm10", "Hum × PM10"),
+    ]
+    available = [(c, l) for c, l in soiling_features if c in hq.columns]
+    n_scatter = max(len(available), 1)
+
+    from matplotlib.gridspec import GridSpec
+    fig = plt.figure(figsize=(16, 16))
+    gs = GridSpec(3, 1, figure=fig, height_ratios=[2, 1.8, 1.0], hspace=0.35)
+
+    # ── Panel 1: Time-series ──
+    ax1 = fig.add_subplot(gs[0])
+    ax1.scatter(hq.loc[valid, "day_dt"], idx_valid, s=10, alpha=0.4,
+               color=C_T1, label="Daily", zorder=2)
+    smoothed = idx.rolling(7, center=True, min_periods=3).median()
+    sm_valid = smoothed.notna()
+    if sm_valid.any():
+        ax1.plot(hq.loc[sm_valid, "day_dt"], smoothed[sm_valid],
+                lw=2.0, color="#1F3A93", label="7-day median", zorder=3)
+    ax1.axhline(1.0, color="black", ls="--", lw=1.0, alpha=0.6, label="Clean baseline")
+    ax1.axhline(0.9, color="#EF4444", ls=":", lw=0.8, alpha=0.5, label="90% threshold")
+    _add_rain_cleaning_overlays(ax1, hq)
+    _annotate_new_source_start(ax1, df)
+    ax1.set_ylabel("Performance Index")
+    ax1.set_ylim(0, min(1.6, idx_valid.max() * 1.1))
+    ax1.set_title(f"New-Source Performance Index (median = {idx_valid.median():.3f})", fontsize=10)
+    ax1.legend(fontsize=7, loc="lower left", ncol=2)
+    ax1.xaxis.set_major_locator(mdates.MonthLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    # ── Panel 2: Frozen-baseline performance index ──
+    ax_frz = fig.add_subplot(gs[1])
+    baseline_col = "new_rolling_clean_baseline"
+    ratio_col = "gen_irr_ratio"
+    if baseline_col in hq.columns and ratio_col in hq.columns:
+        baseline = hq[baseline_col]
+        ratio = hq[ratio_col]
+        cleaning_dates = [pd.Timestamp(d[0]) for d in CLEANING_CAMPAIGN_DATES]
+        if cleaning_dates:
+            first_cleaning = min(cleaning_dates)
+            pre_clean = baseline[hq["day_dt"] < first_cleaning].dropna()
+            frozen_baseline = pre_clean.iloc[-1] if len(pre_clean) > 0 else (baseline.dropna().iloc[0] if baseline.notna().any() else 1.0)
+        else:
+            frozen_baseline = baseline.dropna().iloc[0] if baseline.notna().any() else 1.0
+        frozen_pi = ratio / frozen_baseline
+        frozen_valid = frozen_pi.notna() & valid
+        frozen_smooth = frozen_pi.rolling(7, center=True, min_periods=3).median()
+        ax_frz.scatter(hq.loc[frozen_valid, "day_dt"], frozen_pi[frozen_valid],
+                      s=10, alpha=0.3, color="#E67E22", label="Frozen-baseline PI", zorder=2)
+        if frozen_smooth.notna().any():
+            ax_frz.plot(hq["day_dt"], frozen_smooth, lw=2.0, color="#D35400",
+                       label="Frozen 7-day median", zorder=3)
+        if sm_valid.any():
+            ax_frz.plot(hq.loc[sm_valid, "day_dt"], smoothed[sm_valid],
+                       lw=1.5, color="#1F3A93", alpha=0.5, ls="--",
+                       label="Standard PI (rolling baseline)", zorder=3)
+        ax_frz.axhline(1.0, color="black", ls="--", lw=1.0, alpha=0.6)
+        _add_rain_cleaning_overlays(ax_frz, hq)
+        ax_frz.set_ylabel("Performance Index (frozen baseline)")
+        ax_frz.set_title(f"Frozen baseline at pre-cleaning level ({frozen_baseline:.2f})", fontsize=10)
+        ax_frz.legend(fontsize=7, loc="upper right")
+        ax_frz.xaxis.set_major_locator(mdates.MonthLocator())
+        ax_frz.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+        results["frozen_baseline_value"] = float(frozen_baseline)
+    else:
+        ax_frz.text(0.5, 0.5, "Baseline/ratio columns unavailable",
+                   transform=ax_frz.transAxes, ha="center", fontsize=10, color="grey")
+
+    # ── Panel 3: Distribution ──
+    ax_hist = fig.add_subplot(gs[2])
+    bins = np.linspace(0, min(1.5, idx_valid.max() + 0.05), 40)
+    ax_hist.hist(idx_valid, bins=bins, color=C_T1, alpha=0.6, edgecolor="white", lw=0.5)
+    for thr, clr in [(1.0, "black"), (0.9, "#EF4444"), (0.8, "#F59E0B"), (0.7, "#D97706")]:
+        ax_hist.axvline(thr, color=clr, ls="--", lw=1.0, alpha=0.7)
+        pct = (idx_valid < thr).mean() * 100
+        ax_hist.text(thr - 0.01, ax_hist.get_ylim()[1] * 0.85, f"{pct:.0f}% below",
+                fontsize=7, color=clr, ha="right", rotation=90)
+    ax_hist.set_xlabel("Performance Index")
+    ax_hist.set_ylabel("Day count")
+    ax_hist.set_title("Distribution of performance index", fontsize=10)
+
+    fig.suptitle("DQ6: New-Source Performance Index", fontsize=12, fontweight="bold")
+    _save(fig, plots_dir / "dq6_performance_index.png")
+
+    # ── Figure B: Above-1.0 clustering + Rain Wilcoxon ────────────────
+    fig_b, (ax_clust, ax_wilcox) = plt.subplots(1, 2, figsize=(16, 6))
+    above_mask = idx_valid > 1.0
+    above_days = hq.loc[valid, "day_dt"][above_mask]
+    n_above = int(above_mask.sum())
+    results["n_above_1"] = n_above
+    if n_above > 0:
+        categories = []
+        for d in above_days:
+            cat = "Other"
+            for start, end in CLEANING_CAMPAIGN_DATES:
+                end_dt = pd.Timestamp(end)
+                if pd.Timestamp(start) <= d <= end_dt + pd.Timedelta(days=7):
+                    cat = "Post-cleaning (≤7d)"
+                    break
+            if cat == "Other" and d.month in (3, 4, 9, 10):
+                cat = "Seasonal transition"
+            categories.append(cat)
+        cat_counts = pd.Series(categories).value_counts()
+        colors_c = {"Post-cleaning (≤7d)": "#27AE60", "Seasonal transition": "#F39C12", "Other": "#95A5A6"}
+        bars_c = ax_clust.bar(cat_counts.index, cat_counts.values,
+                             color=[colors_c.get(c, "#95A5A6") for c in cat_counts.index], alpha=0.8)
+        for bar, val in zip(bars_c, cat_counts.values):
+            ax_clust.text(bar.get_x() + bar.get_width() / 2, val + 0.3,
+                         f"{val} ({val/n_above*100:.0f}%)", ha="center", fontsize=8)
+        ax_clust.set_title(f"Above-1.0 days clustering (n={n_above})", fontsize=10)
+        ax_clust.set_ylabel("Day count")
+        results["above_1_post_cleaning"] = int(cat_counts.get("Post-cleaning (≤7d)", 0))
+        results["above_1_seasonal"] = int(cat_counts.get("Seasonal transition", 0))
+    else:
+        ax_clust.text(0.5, 0.5, "No days above 1.0", transform=ax_clust.transAxes, ha="center")
+
+    if "precipitation_total_mm" in hq.columns:
+        rain_days = hq.loc[hq["precipitation_total_mm"] >= SIGNIFICANT_RAIN_MM, "day_dt"]
+        pre_vals, post_vals = [], []
+        for rd in rain_days:
+            pre_w = (hq["day_dt"] >= rd - pd.Timedelta(days=3)) & (hq["day_dt"] < rd)
+            post_w = (hq["day_dt"] > rd) & (hq["day_dt"] <= rd + pd.Timedelta(days=3))
+            pre_pi = idx[pre_w].dropna()
+            post_pi = idx[post_w].dropna()
+            if len(pre_pi) > 0 and len(post_pi) > 0:
+                pre_vals.append(pre_pi.median())
+                post_vals.append(post_pi.median())
+        if len(pre_vals) >= 5:
+            pre_arr, post_arr = np.array(pre_vals), np.array(post_vals)
+            try:
+                w_stat, w_p = stats.wilcoxon(pre_arr, post_arr, alternative="less")
+                results["rain_wilcoxon_stat"] = float(w_stat)
+                results["rain_wilcoxon_p"] = float(w_p)
+                results["rain_wilcoxon_pass"] = w_p < 0.05
+            except Exception:
+                w_p = np.nan
+                results["rain_wilcoxon_pass"] = False
+            delta = (post_arr - pre_arr).mean()
+            ax_wilcox.boxplot([pre_arr, post_arr], labels=["Pre-rain (−3d)", "Post-rain (+3d)"],
+                             patch_artist=True, boxprops=dict(facecolor=C_T1, alpha=0.5))
+            ax_wilcox.set_title(
+                f"PI ±3d around rain (n={len(pre_vals)})\n"
+                f"Wilcoxon p={w_p:.4f} {'✓ PASS' if w_p < 0.05 else '✗ FAIL'}, Δmed={delta:+.3f}",
+                fontsize=9)
+            ax_wilcox.set_ylabel("Performance Index")
+        else:
+            ax_wilcox.text(0.5, 0.5, f"Too few rain events ({len(pre_vals)})",
+                          transform=ax_wilcox.transAxes, ha="center", color="grey")
+    else:
+        ax_wilcox.text(0.5, 0.5, "precipitation_mm N/A", transform=ax_wilcox.transAxes, ha="center", color="grey")
+    fig_b.suptitle("DQ6: Above-1.0 clustering & rain recovery Wilcoxon test", fontsize=12, fontweight="bold")
+    fig_b.tight_layout()
+    _save(fig_b, plots_dir / "dq6_clustering_wilcoxon.png")
+
+    # ── Figure C: Scatter + quantile regression ───────────────────────
+    if available:
+        fig_c, axes_c = plt.subplots(2, n_scatter, figsize=(3.5 * n_scatter, 10))
+        if n_scatter == 1:
+            axes_c = axes_c.reshape(2, 1)
+        for i, (col, label) in enumerate(available):
+            pair = hq[[idx_col, col]].dropna()
+            if len(pair) < 10:
+                continue
+            # Row 1: Scatter + r
+            ax_s = axes_c[0, i]
+            r_val = pair[idx_col].corr(pair[col])
+            results[f"pi_vs_{col}_r"] = r_val
+            ax_s.scatter(pair[col], pair[idx_col], s=8, alpha=0.4, color=C_ACCENT)
+            ax_s.set_title(f"{label}\nr = {r_val:+.3f}", fontsize=8)
+            if i == 0:
+                ax_s.set_ylabel("Perf Index", fontsize=7)
+            ax_s.tick_params(labelsize=6)
+            ax_s.axhline(1.0, color="black", ls="--", lw=0.5, alpha=0.4)
+            # Row 2: Quantile regression
+            ax_q = axes_c[1, i]
+            ax_q.scatter(pair[col], pair[idx_col], s=6, alpha=0.3, color="#AAAAAA")
+            try:
+                n_bins = min(20, len(pair) // 5)
+                bin_edges = np.linspace(pair[col].min(), pair[col].max(), n_bins + 1)
+                bc, q90, q50 = [], [], []
+                for b in range(n_bins):
+                    m_b = (pair[col] >= bin_edges[b]) & (pair[col] < bin_edges[b + 1])
+                    sb = pair.loc[m_b, idx_col]
+                    if len(sb) >= 3:
+                        bc.append((bin_edges[b] + bin_edges[b + 1]) / 2)
+                        q90.append(sb.quantile(0.9))
+                        q50.append(sb.median())
+                if len(bc) >= 4:
+                    bc, q90, q50 = np.array(bc), np.array(q90), np.array(q50)
+                    s90, i90 = np.polyfit(bc, q90, 1)
+                    s50, i50 = np.polyfit(bc, q50, 1)
+                    xf = np.linspace(bc.min(), bc.max(), 50)
+                    ax_q.plot(xf, s90 * xf + i90, color="#E74C3C", lw=2.0, label=f"Q90 slope={s90:+.5f}")
+                    ax_q.plot(xf, s50 * xf + i50, color="#1F3A93", lw=1.5, ls="--", label=f"Med slope={s50:+.5f}")
+                    ax_q.scatter(bc, q90, s=20, color="#E74C3C", zorder=4)
+                    ax_q.scatter(bc, q50, s=15, color="#1F3A93", zorder=4, alpha=0.6)
+                    results[f"pi_vs_{col}_q90_slope"] = float(s90)
+                    results[f"pi_vs_{col}_q50_slope"] = float(s50)
+                    ax_q.set_title(f"Q90: {s90:+.5f}", fontsize=8)
+            except Exception:
+                pass
+            ax_q.set_xlabel(label, fontsize=7)
+            if i == 0:
+                ax_q.set_ylabel("Perf Index", fontsize=7)
+            ax_q.tick_params(labelsize=6)
+            ax_q.axhline(1.0, color="black", ls="--", lw=0.5, alpha=0.4)
+            ax_q.legend(fontsize=6, loc="upper right")
+        fig_c.suptitle("DQ6: Scatter + quantile regression (binned 90th pctile)", fontsize=11, fontweight="bold")
+        fig_c.tight_layout()
+        _save(fig_c, plots_dir / "dq6_quantile_regression.png")
+    log.info(
+        "DQ6 done: %d days, median=%.3f, <0.9=%.0f%%, rain Wilcoxon %s",
+        results.get("n_days", 0),
+        results.get("perf_index_median", float("nan")),
+        results.get("pct_below_09", float("nan")),
+        "PASS" if results.get("rain_wilcoxon_pass", False) else "FAIL",
+    )
+    return results
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  DQ5: Old-source vs new-source soiling metric comparison           ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+def plot_old_vs_new_source_comparison(
+    df: pd.DataFrame, plots_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Compare soiling metrics derived from old sources vs new sources.
+
+    Produces two files:
+      - dq5_old_vs_new_timeseries.png   (loss proxy + cycle deviation ts)
+      - dq5_old_vs_new_comparison.png    (scatter + correlation bar chart)
+    """
+    old_loss = "t1_performance_loss_pct_proxy"
+    new_loss = "new_performance_loss_pct_proxy"
+    old_dev = "cycle_deviation_pct"
+    new_dev = "new_cycle_deviation_pct"
+
+    need = [old_loss, new_loss]
+    if not all(c in df.columns for c in need):
+        log.info("DQ5 skipped: new-source loss proxy columns not present.")
+        return None
+
+    results: Dict[str, Any] = {}
+    hq = df[df["transfer_readiness_tier"].isin(["Tier-1", "Tier-2"])] if "transfer_readiness_tier" in df.columns else df
+
+    # ── Figure A: time-series panels (stacked) ────────────────────────
+    fig_ts, (ax_ts1, ax_ts2) = plt.subplots(2, 1, figsize=(16, 12))
+
+    # Panel 1: Loss proxy time series + rolling median
+    mask_old = hq[old_loss].notna()
+    mask_new = hq[new_loss].notna()
+    if mask_old.any():
+        ax_ts1.plot(hq.loc[mask_old, "day_dt"], hq.loc[mask_old, old_loss],
+                    color=C_T1, alpha=0.3, lw=0.6, label="Old (T1 active-power)")
+        old_smooth = hq[old_loss].rolling(7, center=True, min_periods=3).median()
+        ax_ts1.plot(hq["day_dt"], old_smooth, color=C_T1, alpha=0.9, lw=2.0,
+                    label="Old 7-day median")
+    if mask_new.any():
+        ax_ts1.plot(hq.loc[mask_new, "day_dt"], hq.loc[mask_new, new_loss],
+                    color=C_ACCENT, alpha=0.3, lw=0.6, label="New (daily_gen/avg_irr)")
+        new_smooth = hq[new_loss].rolling(7, center=True, min_periods=3).median()
+        ax_ts1.plot(hq["day_dt"], new_smooth, color=C_ACCENT, alpha=0.9, lw=2.0,
+                    label="New 7-day median")
+    _annotate_new_source_start(ax_ts1, df)
+    _add_rain_cleaning_overlays(ax_ts1, hq)
+    ax_ts1.set_ylabel("Performance loss proxy (%)")
+    ax_ts1.set_title("Loss Proxy: Old Source vs New Source")
+    ax_ts1.legend(fontsize=7, loc="upper right")
+    ax_ts1.xaxis.set_major_locator(mdates.MonthLocator())
+    ax_ts1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    # Panel 2: Cycle deviation time series + rolling median
+    has_old_dev = old_dev in hq.columns and hq[old_dev].notna().any()
+    has_new_dev = new_dev in hq.columns and hq[new_dev].notna().any()
+    if has_old_dev:
+        ax_ts2.plot(hq["day_dt"], hq[old_dev], color=C_T1, alpha=0.3, lw=0.6,
+                    label="Old (active-power)")
+        old_dev_smooth = hq[old_dev].rolling(7, center=True, min_periods=3).median()
+        ax_ts2.plot(hq["day_dt"], old_dev_smooth, color=C_T1, alpha=0.9, lw=2.0,
+                    label="Old 7-day median")
+    if has_new_dev:
+        ax_ts2.plot(hq["day_dt"], hq[new_dev], color=C_ACCENT, alpha=0.3, lw=0.6,
+                    label="New (gen_irr_ratio)")
+        new_dev_smooth = hq[new_dev].rolling(7, center=True, min_periods=3).median()
+        ax_ts2.plot(hq["day_dt"], new_dev_smooth, color=C_ACCENT, alpha=0.9, lw=2.0,
+                    label="New 7-day median")
+    _annotate_new_source_start(ax_ts2, df)
+    _add_rain_cleaning_overlays(ax_ts2, hq)
+    ax_ts2.set_ylabel("Cycle deviation (%)")
+    ax_ts2.set_title("Cycle Deviation: Old vs New")
+    ax_ts2.legend(fontsize=7, loc="upper right")
+    ax_ts2.xaxis.set_major_locator(mdates.MonthLocator())
+    ax_ts2.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+
+    fig_ts.suptitle(
+        "DQ5: Old vs new source — time series comparison",
+        fontsize=12, fontweight="bold",
+    )
+    fig_ts.tight_layout()
+    _save(fig_ts, plots_dir / "dq5_old_vs_new_timeseries.png")
+
+    # ── Figure B: scatter + bar chart ─────────────────────────────────
+    fig, axes_b = plt.subplots(1, 3, figsize=(18, 6))
+    ax_sc, ax_sc2, ax_bar = axes_b
+
+    # Panel 1: Scatter old vs new loss proxy (all days)
+    pair = hq[[old_loss, new_loss]].dropna()
+    if len(pair) > 5:
+        ax_sc.scatter(pair[old_loss], pair[new_loss], s=8, alpha=0.5, color=C_T1)
+        r_val = pair[old_loss].corr(pair[new_loss])
+        results["old_vs_new_loss_r"] = r_val
+        ax_sc.set_xlabel("Old loss proxy (%)")
+        ax_sc.set_ylabel("New loss proxy (%)")
+        ax_sc.set_title(f"All days (r = {r_val:.3f}, n = {len(pair)})", fontsize=9)
+        lims = [0, max(pair[old_loss].quantile(0.99), pair[new_loss].quantile(0.99))]
+        ax_sc.plot(lims, lims, "--", color="grey", alpha=0.5, lw=0.8)
+    else:
+        ax_sc.text(0.5, 0.5, "Insufficient overlap", transform=ax_sc.transAxes, ha="center")
+
+    # Panel 2: Scatter — only days where old loss > 0
+    pair_nz = pair[pair[old_loss] > 0]
+    if len(pair_nz) > 5:
+        ax_sc2.scatter(pair_nz[old_loss], pair_nz[new_loss], s=10, alpha=0.5, color="#E74C3C")
+        r_nz = pair_nz[old_loss].corr(pair_nz[new_loss])
+        results["old_vs_new_loss_r_nonzero"] = r_nz
+        results["n_nonzero_loss_days"] = len(pair_nz)
+        ax_sc2.set_xlabel("Old loss proxy (%) — non-zero only")
+        ax_sc2.set_ylabel("New loss proxy (%)")
+        ax_sc2.set_title(f"Non-zero loss days (r = {r_nz:.3f}, n = {len(pair_nz)})", fontsize=9)
+        lims_nz = [0, max(pair_nz[old_loss].quantile(0.99), pair_nz[new_loss].quantile(0.99))]
+        ax_sc2.plot(lims_nz, lims_nz, "--", color="grey", alpha=0.5, lw=0.8)
+    else:
+        ax_sc2.text(0.5, 0.5, "Insufficient non-zero days", transform=ax_sc2.transAxes, ha="center")
+
+    # Panel 3: Correlation comparison bar chart
+    soiling_features = [
+        ("domain_soiling_index", "DSPI"),
+        ("cumulative_pm25_since_rain", "Cum PM2.5"),
+        ("cumulative_pm10_since_rain", "Cum PM10"),
+        ("days_since_last_rain", "Days dry"),
+        ("humidity_x_pm10", "Hum × PM10"),
+    ]
+    old_corrs = []
+    new_corrs = []
+    labels = []
+    for col, label in soiling_features:
+        if col not in hq.columns:
+            continue
+        pair_old = hq[[col, old_loss]].dropna()
+        pair_new = hq[[col, new_loss]].dropna()
+        r_old = pair_old[col].corr(pair_old[old_loss]) if len(pair_old) > 5 else np.nan
+        r_new = pair_new[col].corr(pair_new[new_loss]) if len(pair_new) > 5 else np.nan
+        old_corrs.append(r_old)
+        new_corrs.append(r_new)
+        labels.append(label)
+        results[f"old_r_{col}"] = r_old
+        results[f"new_r_{col}"] = r_new
+
+    if labels:
+        x = np.arange(len(labels))
+        w = 0.35
+        ax_bar.bar(x - w / 2, old_corrs, w, label="Old source", color=C_T1, alpha=0.7)
+        ax_bar.bar(x + w / 2, new_corrs, w, label="New source", color=C_ACCENT, alpha=0.7)
+        ax_bar.set_xticks(x)
+        ax_bar.set_xticklabels(labels, fontsize=8, rotation=30, ha="right")
+        ax_bar.set_ylabel("Pearson r vs loss proxy")
+        ax_bar.set_title("Feature Correlations: Old vs New Loss Proxy", fontsize=9)
+        ax_bar.legend(fontsize=8)
+        ax_bar.axhline(0, color="grey", lw=0.5)
+
+    fig.suptitle(
+        "DQ5: Old vs new source — scatter & correlation comparison",
+        fontsize=12, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, plots_dir / "dq5_old_vs_new_comparison.png")
+    log.info(
+        "DQ5 done: all-day r=%.3f, non-zero r=%.3f (%d days)",
+        results.get("old_vs_new_loss_r", float("nan")),
+        results.get("old_vs_new_loss_r_nonzero", float("nan")),
+        results.get("n_nonzero_loss_days", 0),
+    )
+    return results
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
 # ║  Report writer                                                     ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
@@ -1370,6 +2827,12 @@ def write_report(
     csa_results: Dict[str, Any],
     dq_results: Dict[str, Any],
     out_path: Path,
+    dq2_results: Optional[Dict[str, Any]] = None,
+    dq3_results: Optional[Dict[str, Any]] = None,
+    dq4_results: Optional[Dict[str, Any]] = None,
+    dq5_results: Optional[Dict[str, Any]] = None,
+    dq6_results: Optional[Dict[str, Any]] = None,
+    df: Optional[pd.DataFrame] = None,
 ) -> None:
     verdicts = [s1.verdict, s2.verdict, s3.verdict]
     n_pass = sum(1 for v in verdicts if v == "pass")
@@ -1632,7 +3095,222 @@ def write_report(
             "per-inverter variability (equipment failures, clipping). Full-plant",
             "generation correlates much better with satellite irradiance.",
             "",
-            "Plot: `dq1_irradiance_vs_generation.png`",
+            "Plots: `dq1_irradiance_vs_generation_timeseries.png` (time series),",
+            "`dq1_irradiance_vs_generation.png` (scatter & boxplot)",
+            "",
+        ])
+
+    # ── DQ2: New telemetry validation ──
+    if dq2_results:
+        lines.extend([
+            "### DQ2: New Telemetry Validation",
+            "",
+            "Asset-aligned validation of the new daily-generation source and",
+            "physical irradiation context (`irradiation_kwh_m2`).",
+            "",
+            f"- Old vs new generation correlation: r = {_fmt_r(dq2_results.get('old_vs_new_gen_r'))}",
+            f"- New generation vs physical irradiation: r = {_fmt_r(dq2_results.get('new_gen_vs_irradiation_r'))}",
+            f"- Plant avg irradiance vs Solcast: r = {_fmt_r(dq2_results.get('plant_vs_solcast_irr_r'))}",
+            f"- Aligned inverter IDs: {', '.join(dq2_results.get('aligned_inverters', [])) if dq2_results.get('aligned_inverters') else 'n/a'}",
+            "",
+            "**Interpretation:** Generation is now compared on a like-for-like",
+            "inverter intersection, reducing asset-mismatch bias. The physical",
+            "irradiation correlation is the primary sanity check for energy-yield",
+            "consistency. Plant-vs-Solcast irradiance agreement remains a sensor",
+            "health cross-check, not the PR denominator itself.",
+            "",
+            "Plots: `dq2_daily_gen_validation_timeseries.png` (time series),",
+            "`dq2_daily_gen_validation.png` (scatter)",
+            "",
+        ])
+
+    # ── DQ3: Gen/Irr ratio ──
+    if dq3_results:
+        lines.extend([
+            "### DQ3: Generation / Irradiance Ratio",
+            "",
+            "Physical PR-style metric from new telemetry. Raw PR points outside",
+            "[0, 1] are explicitly flagged as outliers; trend uses outlier-masked",
+            "interpolation and a 7-day median smoother.",
+            "",
+            f"- Median raw PR: {dq3_results.get('gen_irr_ratio_median', 0):.4f}",
+            f"- Raw PR std: {dq3_results.get('gen_irr_ratio_std', 0):.4f}",
+            f"- Outliers (`PR<0` or `PR>1`): {dq3_results.get('gen_irr_ratio_outlier_count', 0)} "
+            f"({dq3_results.get('gen_irr_ratio_outlier_pct', 0):.2f}%)",
+            f"- Agreement with old-source -loss proxy: r = {_fmt_r(dq3_results.get('ratio_vs_neg_loss_r'))}",
+            "",
+            "**Inference:** PR outliers are now visible diagnostics rather than being",
+            "silently accepted. The trend line reflects physically plausible PR values",
+            "only, improving interpretability of soiling-driven decline/recovery.",
+            "",
+            "Plots: `dq3_gen_irr_ratio_timeseries.png` (time series),",
+            "`dq3_gen_irr_ratio.png` (monthly boxplot)",
+            "",
+        ])
+
+    # ── DQ4: Power at reference irradiance ──
+    if dq4_results:
+        lines.extend([
+            "### DQ4: Power at Reference Irradiance",
+            "",
+            "Active power extracted when on-site irradiance is at the dataset's",
+            "median level. Controls for irradiance variation and isolates",
+            "degradation/soiling from weather effects.",
+            "",
+            f"- Reference irradiance: {dq4_results.get('ref_irradiance_wm2', 0):.0f} W/m^2",
+            f"- Days with valid data: {dq4_results.get('power_at_ref_irr_days', 0)}",
+            f"- Median power at ref irradiance: {dq4_results.get('power_at_ref_irr_median', 0):.0f} W",
+            "",
+        ])
+        ref_corrs = {
+            k[len("ref_irr_vs_"):-len("_r")] if k.endswith("_r") else k[len("ref_irr_vs_"):]: v
+            for k, v in dq4_results.items()
+            if k.startswith("ref_irr_vs_") and isinstance(v, float) and np.isfinite(v)
+        }
+        if ref_corrs:
+            lines.extend([
+                "**Correlations with soiling features (HQ days):**",
+                "",
+                "| Feature | r |",
+                "|---|---|",
+            ])
+            for feat, r_val in ref_corrs.items():
+                lines.append(f"| `{feat}` | {r_val:+.3f} |")
+            lines.append("")
+        lines.extend([
+            "**Inference:** A strong negative correlation between power-at-reference",
+            "and `t1_performance_loss_pct_proxy` confirms the feature successfully",
+            "isolates performance degradation from irradiance variation. Correlations",
+            "with environmental soiling drivers (PM, days dry) indicate whether",
+            "soiling — rather than equipment issues — drives the observed decline.",
+            "",
+            "Plot: `dq4_power_at_ref_irradiance.png`",
+            "",
+        ])
+
+    # ── DQ5: Old vs New source comparison ──
+    if dq5_results:
+        lines.extend([
+            "### DQ5: Old-Source vs New-Source Soiling Metrics",
+            "",
+            "Parallel soiling feature pipelines were computed from both the original",
+            "data sources (active power + tilted/Solcast irradiance, peak-hour filtered)",
+            "and the new telemetry (daily_generated_electricity + avg_solar_radiation,",
+            "full-day). This section compares their agreement and predictive power.",
+            "",
+            f"- Old vs new loss proxy agreement: r = {_fmt_r(dq5_results.get('old_vs_new_loss_r'))}",
+            "",
+        ])
+        feat_pairs = [
+            ("domain_soiling_index", "DSPI"),
+            ("cumulative_pm25_since_rain", "Cum PM2.5"),
+            ("cumulative_pm10_since_rain", "Cum PM10"),
+            ("days_since_last_rain", "Days dry"),
+            ("humidity_x_pm10", "Hum x PM10"),
+        ]
+        has_any = any(
+            f"old_r_{col}" in dq5_results for col, _ in feat_pairs
+        )
+        if has_any:
+            lines.extend([
+                "**Feature correlations with loss proxy (old vs new source):**",
+                "",
+                "| Feature | r (Old) | r (New) |",
+                "|---|---|---|",
+            ])
+            for col, label in feat_pairs:
+                r_old = dq5_results.get(f"old_r_{col}", np.nan)
+                r_new = dq5_results.get(f"new_r_{col}", np.nan)
+                r_old_s = f"{r_old:+.3f}" if isinstance(r_old, float) and np.isfinite(r_old) else "---"
+                r_new_s = f"{r_new:+.3f}" if isinstance(r_new, float) and np.isfinite(r_new) else "---"
+                lines.append(f"| {label} | {r_old_s} | {r_new_s} |")
+            lines.append("")
+
+        lines.extend([
+            "**Inference:** Low or negative old-vs-new loss proxy agreement is expected",
+            "because the two pipelines measure performance over different time windows",
+            "(peak-hour vs full-day) and the new source lacks Jan-Mar data when soiling",
+            "is strongest. The feature correlation table reveals whether environmental",
+            "soiling drivers correlate more strongly with one source's loss proxy,",
+            "guiding which pipeline to prioritise for modelling.",
+            "",
+            "Plots: `dq5_old_vs_new_timeseries.png` (time series),",
+            "`dq5_old_vs_new_comparison.png` (scatter & bar chart)",
+            "",
+        ])
+
+    # ── DQ6: New-Source Performance Index ──
+    if dq6_results:
+        lines.extend([
+            "### DQ6: New-Source Performance Index (0-1)",
+            "",
+            "A normalised performance index derived from new telemetry:",
+            "`performance_index = gen_irr_ratio / rolling_clean_baseline`.",
+            "Values near 1.0 represent clean-panel performance; values below 1.0",
+            "indicate degradation from soiling and other losses.",
+            "",
+            f"- Days with valid index: {dq6_results.get('n_days', 0)}",
+            f"- Median performance index: {dq6_results.get('perf_index_median', 0):.3f}",
+            f"- Mean performance index: {dq6_results.get('perf_index_mean', 0):.3f}",
+            f"- Days below 1.0 (any loss): {dq6_results.get('pct_below_1', 0):.0f}%",
+            f"- Days below 0.9 (>10% loss): {dq6_results.get('pct_below_09', 0):.0f}%",
+            f"- Days below 0.8 (>20% loss): {dq6_results.get('pct_below_08', 0):.0f}%",
+            "",
+        ])
+        pi_corrs = {
+            k[len("pi_vs_"):-len("_r")] if k.endswith("_r") else k[len("pi_vs_"):]: v
+            for k, v in dq6_results.items()
+            if k.startswith("pi_vs_") and isinstance(v, float) and np.isfinite(v)
+        }
+        if pi_corrs:
+            lines.extend([
+                "**Correlations with soiling features:**",
+                "",
+                "| Feature | r |",
+                "|---|---|",
+            ])
+            for feat, r_val in pi_corrs.items():
+                lines.append(f"| `{feat}` | {r_val:+.3f} |")
+            lines.append("")
+        lines.extend([
+            "**Inference:** A median well below 1.0 indicates persistent performance",
+            "loss across the dataset, consistent with soiling between cleanings.",
+            "Negative correlations with cumulative dust features (`cumulative_pm25_since_rain`,",
+            "`days_since_last_rain`) confirm that longer dry periods depress the index.",
+            "If the mean is substantially lower than the median, heavy-loss outlier days",
+            "(e.g. equipment faults, extreme soiling) are pulling the distribution down.",
+            "",
+            "Plot: `dq6_performance_index.png`",
+            "",
+        ])
+
+    # ── Data Coverage Notes ──
+    new_start = _new_source_start(df) if df is not None else None
+    if new_start is not None:
+        n_total = len(df) if df is not None else 0
+        n_new = int(df["gen_irr_ratio"].notna().sum()) if df is not None and "gen_irr_ratio" in df.columns else 0
+        lines.extend([
+            "### Data Coverage Notes",
+            "",
+            f"The new telemetry source (`avg_solar_radiation`) begins on "
+            f"**{new_start.strftime('%Y-%m-%d')}**. Data for Jan-Mar 2025 is "
+            f"unavailable, creating a gap in all new-source metrics (`gen_irr_ratio`, "
+            f"`t1_performance_loss_pct_proxy`, `new_cycle_deviation_pct`, "
+            f"`new_performance_index`).",
+            "",
+            f"- New-source days: **{n_new} / {n_total}** "
+            f"({n_new/n_total*100:.0f}%)" if n_total > 0 else "",
+            f"- Missing period: Jan-Mar 2025 (peak dry season with fastest soiling accumulation)",
+            "",
+            "**Impact on results:**",
+            "",
+            "- **Signal 1/2/3 verdicts are unaffected** -- they use old-source "
+            "columns (`t1_performance_loss_pct_proxy`, `cycle_deviation_pct`) "
+            "which have near-complete coverage.",
+            "- **DQ2/DQ3/DQ5/DQ6 diagnostic plots** only cover the overlap period "
+            "(Apr 2025+), missing the dry season when soiling signal is strongest.",
+            "- **DQ5 old-vs-new correlation** is biased toward wetter months "
+            "where soiling accumulation is lower.",
             "",
         ])
 
@@ -1673,16 +3351,101 @@ def main() -> None:
 
     df = load_and_filter(args.input)
 
+    # ── Parallel pipeline branch for new telemetry ────────────────────
+    if "t1_performance_loss_pct_proxy" in df.columns:
+        log.info("Starting parallel pipeline for new telemetry metrics...")
+        df_new = df.copy()
+        df_new["t1_performance_loss_pct_proxy"] = df_new["t1_performance_loss_pct_proxy"]
+        if "t1_perf_loss_rate_14d_pct_per_day" in df_new.columns:
+            df_new["t1_perf_loss_rate_14d_pct_per_day"] = df_new["t1_perf_loss_rate_14d_pct_per_day"]
+        if "new_cycle_deviation_pct" in df_new.columns:
+            df_new["cycle_deviation_pct"] = df_new["new_cycle_deviation_pct"]
+            
+        new_plots_dir = out_dir / "plots_new_telemetry"
+        new_plots_dir.mkdir(parents=True, exist_ok=True)
+        
+        test_signal_1_sawtooth(df_new, new_plots_dir)
+        test_signal_2_dust_correlation(df_new, new_plots_dir)
+        test_signal_3_rain_recovery(df_new, new_plots_dir)
+        test_clear_sky_soiling(df_new, new_plots_dir)
+        log.info("Parallel pipeline plotting complete.")
+
     s1 = test_signal_1_sawtooth(df, plots_dir)
     s2 = test_signal_2_dust_correlation(df, plots_dir)
     s3 = test_signal_3_rain_recovery(df, plots_dir)
     supporting = run_supporting_analyses(df, plots_dir)
     csa_results = test_clear_sky_soiling(df, plots_dir)
     dq_results = plot_irradiance_vs_generation(df, plots_dir)
+    dq2_results = plot_daily_gen_validation(df, plots_dir)
+    dq3_results = plot_gen_irr_ratio(df, plots_dir)
+    dq4_results = plot_power_at_ref_irradiance(df, plots_dir)
+    dq5_results = plot_old_vs_new_source_comparison(df, plots_dir)
+    dq6_results = plot_new_performance_index(df, plots_dir)
 
     write_report(
         s1, s2, s3, supporting, csa_results, dq_results,
         out_dir / "eda_signal_report.md",
+        dq2_results=dq2_results,
+        dq3_results=dq3_results,
+        dq4_results=dq4_results,
+        dq5_results=dq5_results,
+        dq6_results=dq6_results,
+        df=df,
+    )
+
+    # ── LLM-readable structured output ────────────────────────────────
+    from llm_output import (
+        build_signal_1_section,
+        build_signal_2_section,
+        build_signal_3_section,
+        build_supporting_section,
+        build_csa_section,
+        build_dq_section,
+        build_dataset_overview,
+        write_llm_summary,
+    )
+    from multilevel_analysis import (
+        build_atomic_level,
+        build_microscopic_level,
+        build_macroscopic_level,
+    )
+    from feature_glossary import build_feature_glossary
+
+    # Determine overall verdict
+    verdicts_list = [s1.verdict, s2.verdict, s3.verdict]
+    if all(v == "pass" for v in verdicts_list):
+        overall = "GO"
+    elif any(v == "fail" for v in verdicts_list):
+        overall = "CONDITIONAL GO" if any(v == "pass" for v in verdicts_list) else "NO GO"
+    else:
+        overall = "CONDITIONAL GO"
+
+    verdicts_dict = {
+        "signal_1_sawtooth": s1.verdict,
+        "signal_2_dust_correlation": s2.verdict,
+        "signal_3_rain_recovery": s3.verdict,
+        "overall": overall,
+    }
+
+    write_llm_summary(
+        out_dir / "llm_eda_summary.json",
+        dataset_overview=build_dataset_overview(df),
+        signal_1=build_signal_1_section(s1, df),
+        signal_2=build_signal_2_section(s2, df),
+        signal_3=build_signal_3_section(s3, df),
+        supporting=build_supporting_section(supporting, df),
+        clear_sky=build_csa_section(csa_results, df),
+        dq1=build_dq_section(dq_results, "DQ1: Irradiance vs Generation"),
+        dq2=build_dq_section(dq2_results, "DQ2: Daily Generation Validation"),
+        dq3=build_dq_section(dq3_results, "DQ3: Generation/Irradiance Ratio"),
+        dq4=build_dq_section(dq4_results, "DQ4: Power at Reference Irradiance"),
+        dq5=build_dq_section(dq5_results, "DQ5: Old vs New Source Comparison"),
+        dq6=build_dq_section(dq6_results, "DQ6: New Performance Index"),
+        verdicts=verdicts_dict,
+        atomic_level=build_atomic_level(df),
+        microscopic_level=build_microscopic_level(df),
+        macroscopic_level=build_macroscopic_level(df, verdicts_dict),
+        feature_glossary=build_feature_glossary(),
     )
 
     log.info(

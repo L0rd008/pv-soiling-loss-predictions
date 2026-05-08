@@ -343,6 +343,126 @@ Composite quality scoring for cross-plant model transfer.
 
 ---
 
+## 19. New Telemetry: Daily Generated Electricity (Optional)
+
+Present only if `data/inverters_daily_gen_2025_to_current_none_si.csv` was fetched.
+
+| Column | Type | Unit | Nulls | Description |
+|---|---|---|---|---|
+| `{inv}_daily_gen_j` | float64 | J | variable | Per-inverter daily generated electricity, converted from kWh. |
+| `subset_daily_gen_j` | float64 | J | variable | Sum of all tiered-inverter daily generation in Joules. |
+| `subset_daily_gen_kwh` | float64 | kWh | variable | Same as above in kWh. Direct kWh total, independent of the active-power integral (`subset_energy_j`). |
+
+**Soiling relevance:**
+- Provides a direct cumulative energy measurement, more accurate than integrating 10-min AVG power.
+- Cross-check with `subset_energy_j` validates data consistency.
+
+## 20. New Telemetry: Plant Average Solar Radiation (Optional)
+
+Present only if `data/plant_avg_irradiance_2025_to_current_none_si.csv` was fetched.
+
+| Column | Type | Unit | Nulls | Description |
+|---|---|---|---|---|
+| `plant_avg_irradiance_wm2` | float64 | W/m^2 | variable | Daily average irradiance from the on-site plant sensor. |
+| `plant_irr_records` | int | count | variable | Number of raw readings contributing to the daily value. |
+
+**Soiling relevance:**
+- An independent on-site irradiance source used with `runtime_h` to compute physical daily irradiation (`irradiation_kwh_m2`).
+
+## 21. Runtime and Irradiation (Optional)
+
+Present only if both new telemetry sources are available.
+
+| Column | Type | Unit | Nulls | Description |
+|---|---|---|---|---|
+| `runtime_h` | float64 | hours | variable | Runtime hours used for physical PR denominator (CSV primary, Solcast fallback). |
+| `runtime_source` | object | category | variable | Source of runtime: `runtime_csv` or `solcast_daylight`. |
+| `irradiation_kwh_m2` | float64 | kWh/m^2 | variable | `plant_avg_irradiance_wm2 * runtime_h / 1000`. |
+
+**Soiling relevance:**
+- Provides physically consistent daily irradiation for PR calculations.
+
+## 22. Physical PR Fields (Optional)
+
+Present only if new-source generation and irradiation are available.
+
+| Column | Type | Unit | Nulls | Description |
+|---|---|---|---|---|
+| `subset_capacity_kw` | float64 | kW | variable | Capacity basis for subset PR (`330 * aligned inverter count`). |
+| `plant_capacity_kw` | float64 | kW | variable | Capacity basis for plant PR (`330 * plant inverter count`). |
+| `subset_pr_physical_raw` | float64 | ratio | variable | `subset_daily_gen_kwh / (subset_capacity_kw * irradiation_kwh_m2)`. |
+| `subset_pr_physical_outlier` | bool | — | variable | True when `subset_pr_physical_raw < 0` or `> 1`. |
+| `subset_pr_physical_interp` | float64 | ratio | variable | Outlier-masked subset PR with inside-gap interpolation. |
+| `plant_pr_physical_raw` | float64 | ratio | variable | `daily_generation_kwh / (plant_capacity_kw * irradiation_kwh_m2)`. |
+| `plant_pr_physical_outlier` | bool | — | variable | True when `plant_pr_physical_raw < 0` or `> 1`. |
+| `gen_irr_ratio` | float64 | ratio | variable | Backward-compatible alias of `subset_pr_physical_raw`. |
+| `gen_irr_ratio_smoothed` | float64 | ratio | variable | 7-day centered rolling median of `gen_irr_ratio`. |
+
+**Soiling relevance:**
+- Physical PR trends are directly interpretable; outliers are explicit diagnostics rather than hidden clipping.
+
+## 23. Power at Reference Irradiance
+
+| Column | Type | Unit | Nulls | Description |
+|---|---|---|---|---|
+| `power_at_ref_irradiance_w` | float64 | W | variable | Mean active power when on-site irradiance is within +/-15% of the dataset median. |
+| `ref_irradiance_wm2` | float64 | W/m^2 | 0% | The dataset-wide median irradiance used as reference (constant). |
+| `ref_irr_match_count` | int | count | variable | Number of sub-daily rows that matched the reference band per day. |
+| `t1_power_at_ref_irradiance_w` | float64 | W | variable | Tier-1 variant of the above. |
+| `t2_power_at_ref_irradiance_w` | float64 | W | variable | Tier-2 variant of the above. |
+
+**Soiling relevance:**
+- Controls for daily irradiance variation by measuring power output at a fixed irradiance level.
+- On a clean system, power at the reference irradiance should be stable. Soiling reduces it over time.
+- Not affected by the on-site irradiance unit inconsistency (uses relative median matching).
+
+## 23. New-Source Performance Loss Proxy (Optional)
+
+Present only if `gen_irr_ratio` is available (requires both new telemetry sources).
+
+| Column | Type | Unit | Nulls | Description |
+|---|---|---|---|---|
+| `new_normalized_output` | float64 | kWh/(W/m^2) | variable | Same as `gen_irr_ratio`, used as the ratio input for the loss proxy pipeline. |
+| `new_normalized_output_14d_median` | float64 | kWh/(W/m^2) | variable | 14-day rolling median of `new_normalized_output`. |
+| `new_rolling_clean_baseline` | float64 | kWh/(W/m^2) | variable | 30-day rolling 95th percentile of `new_normalized_output` on clear days. |
+| `new_performance_loss_pct_proxy` | float64 | % | variable | `100 * (1 - new_normalized_output / new_rolling_clean_baseline)`. |
+| `new_perf_loss_rate_14d_pct_per_day` | float64 | %/day | variable | 14-day rate of change of `new_performance_loss_pct_proxy`. |
+
+**Soiling relevance:**
+- Parallel loss proxy pipeline from the new full-day telemetry. Allows direct comparison with the old peak-hour source.
+- Higher agreement with the old proxy confirms both sources track the same soiling signal.
+
+## 24. New-Source Cycle Deviation (Optional)
+
+Present only if `gen_irr_ratio` is available.
+
+| Column | Type | Unit | Nulls | Description |
+|---|---|---|---|---|
+| `new_cycle_id` | int | — | variable | Soiling cycle identifier (reset by rain/cleaning), from new-source data. |
+| `new_soiling_index_x` | float64 | kWh/(W/m^2) | variable | `gen_irr_ratio` used directly as the soiling index. |
+| `new_cycle_max_x` | float64 | kWh/(W/m^2) | variable | Maximum `new_soiling_index_x` within each cycle. |
+| `new_cycle_deviation_pct` | float64 | % | variable | `100 * (1 - new_soiling_index_x / new_cycle_max_x)`. |
+
+**Soiling relevance:**
+- Within-cycle deviation from peak performance using the new-source ratio.
+- Can be compared against old `cycle_deviation_pct` to validate signal consistency.
+
+## 25. New-Source Performance Index (Optional)
+
+Present only if both `gen_irr_ratio` and `new_rolling_clean_baseline` are available.
+
+| Column | Type | Unit | Nulls | Description |
+|---|---|---|---|---|
+| `new_performance_index` | float64 | — (0-1) | variable | `gen_irr_ratio / new_rolling_clean_baseline`, capped at 1.5. |
+
+**Soiling relevance:**
+- A normalised 0-1 metric: 1.0 = clean-panel performance, <1.0 = degradation.
+- Intuitive for interpretation: 0.85 means operating at 85% of clean baseline.
+- Equivalent to `1 - new_performance_loss_pct_proxy / 100` by construction.
+- Negative correlations with dust features (DSPI, cumulative PM) indicate soiling drives the degradation.
+
+---
+
 ## Null Summary
 
 | Null % | Columns | Reason |
@@ -361,8 +481,8 @@ Composite quality scoring for cross-plant model transfer.
 
 ## Recommended EDA Workflow
 
-This workflow has been implemented as `scripts/eda_soiling_signals.py`.
-See `docs/pipeline_replication/05_eda_soiling_signals.md` for run
+This workflow has been implemented as `scripts/5_eda/soiling_signals.py`.
+See `docs/pipeline/05_eda_soiling_signals.md` for run
 instructions and `docs/eda_output_interpretation.md` for how to read
 each output plot.
 

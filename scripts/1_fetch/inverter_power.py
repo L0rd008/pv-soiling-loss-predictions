@@ -6,7 +6,7 @@ in milliamps and are divided by 1000 to produce SI amperes.
 
 Usage::
 
-    python scripts/inverter_data_fetch.py
+    python scripts/1_fetch/inverter_power.py
 
 Environment variables (see ``.env.example``):
     TB_URL, TB_TOKEN, TB_INV_KEYS, TB_INVERTERS
@@ -16,8 +16,11 @@ Environment variables (see ``.env.example``):
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
 
-from tb_client import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.tb_client import (
     auth_headers,
     fetch_chunked,
     get_output_dir,

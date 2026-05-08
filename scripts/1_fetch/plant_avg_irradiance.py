@@ -9,7 +9,7 @@ Preprocessing takes the last reading per day as the daily average.
 
 Usage::
 
-    python scripts/plant_avg_irradiance_fetch.py
+    python scripts/1_fetch/plant_avg_irradiance.py
 
 Environment variables (see ``.env.example``):
     TB_URL, TB_TOKEN, TB_PLNT_ID, TB_PLNT_IRR_KEYS
@@ -18,10 +18,13 @@ Environment variables (see ``.env.example``):
 
 import logging
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import requests
 
-from tb_client import (
+from core.tb_client import (
     auth_headers,
     get_output_dir,
     get_request_timeout,

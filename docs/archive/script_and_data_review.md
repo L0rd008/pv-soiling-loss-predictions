@@ -3,10 +3,10 @@
 ## Scope
 
 Reviewed files:
-- `scripts/inverter_data_fetch.py`
-- `scripts/irradiance_data_fetch.py`
-- `scripts/power_generation_data_fetch.py`
-- `scripts/jwt_fetch.py`
+- `scripts/1_fetch/inverter_power.py`
+- `scripts/1_fetch/irradiance.py`
+- `scripts/1_fetch/power_generation.py`
+- `scripts/0_setup/jwt_fetch.py`
 - `data/inverters_2025_to_current_10min_avg_si.csv`
 - `data/irradiance_2025_to_current_15min_sum_si.csv`
 - `data/power_generation_2025_to_current_1day_none_si.csv`
@@ -19,7 +19,7 @@ Reviewed files:
 - Action: aggregate to one trusted daily value (for example, latest or max per day after validation).
 
 2. Generation conversion logic has hard-coded clipping assumptions.
-- File: `scripts/power_generation_data_fetch.py`
+- File: `scripts/1_fetch/power_generation.py`
 - Impact: extreme values are force-clamped to a fixed constant, which can hide genuine quality issues.
 - Action: replace hard clamp with explicit invalid flag/NaN and preserve raw value for traceability.
 
@@ -55,7 +55,7 @@ Reviewed files:
 
 ## Implemented in This Repo Update
 
-- Added `scripts/data_quality_audit.py` to:
+- Added `scripts/4_audit/audit.py` to:
   - Standardize loading/parsing.
   - Quantify interval irregularity and missingness.
   - Produce daily merged features and anomaly flags.
@@ -66,7 +66,7 @@ Reviewed files:
   - Treat invalid generation values as missing instead of forcing fixed constants.
 - Added `README.md` with stakeholder-centric objectives and workflow.
 - Added `requirements.txt` and tightened `.gitignore`.
-- Added `scripts/data_preprocess.py` for deterministic cleaning and daily model-table generation.
+- Added `scripts/3_preprocess/preprocess.py` for deterministic cleaning and daily model-table generation.
 - Added `docs/preprocessing_plan.md` and `docs/data_dictionary.md` updates for cross-plant inference usage.
 
 ## Recommended Next Engineering Actions

@@ -51,7 +51,7 @@ Resolution:
   reference curve.
 
 Where implemented:
-- `scripts/daily_features.py`:
+- `scripts/core/daily_features.py`:
   - `MIN_IRRADIANCE_FOR_BASELINE`
   - `compute_performance_features()`
   - `compute_quality_flags()` (`flag_sensor_suspect_irradiance`)
@@ -69,7 +69,7 @@ Resolution:
 - The 14-day median is used as a short-term "typical" reference, not a long-term trend.
 
 Where implemented:
-- `scripts/daily_features.py`: `normalized_output_14d_median`
+- `scripts/core/daily_features.py`: `normalized_output_14d_median`
 
 ### 3) Data leak concern for "soiling loss" feature
 
@@ -82,7 +82,7 @@ Resolution:
 - It should not be used as ground-truth soiling label without validation.
 
 Where implemented:
-- `scripts/daily_features.py`: `performance_loss_pct_proxy`
+- `scripts/core/daily_features.py`: `performance_loss_pct_proxy`
 - pipeline outputs and docs renamed accordingly
 
 ### 4) Is clear-day loss equal to soiling only?
@@ -100,7 +100,7 @@ Current recommendation:
 - Keep proxy for monitoring/ranking.
 - Build validated labels using O&M logs before supervised failure modeling.
 - Temperature correction is now implemented via `pvlib.temperature.sapm_cell()`
-  in `scripts/daily_features.py`: `compute_temperature_corrected_pr()`.
+  in `scripts/core/daily_features.py`: `compute_temperature_corrected_pr()`.
   The `pr_temperature_corrected` column partially removes thermal effects
   from the performance loss proxy.
 
@@ -230,7 +230,7 @@ Rules:
 ### ✅ Resolved: Native unit of `EnergyMeter_dailyGeneration`
 
 - Confirmed: native unit is **kWh**.
-- The fetch script (`scripts/power_generation_data_fetch.py`) already converts
+- The fetch script (`scripts/1_fetch/power_generation.py`) already converts
   kWh → Joules at fetch time (`raw_kwh * KWH_TO_JOULES`).
 - Downstream pipeline variables (`daily_generation_j`, `subset_energy_j`) and
   conversions (`/ 3.6e9` for MWh) are therefore correct.

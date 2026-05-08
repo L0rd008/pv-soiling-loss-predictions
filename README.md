@@ -29,9 +29,9 @@ Practical implications:
 - Separate plant-specific KPIs from generally transferable patterns.
 
 Detailed assumptions and concern handling are documented in
-`docs/domain_context_and_concern_resolution.md`.
+`docs/reference/domain_context.md`.
 Event-log schema for future supervised labels is documented in
-`docs/canonical_event_table.md`.
+`docs/reference/canonical_event_table.md`.
 
 ## Stakeholder-Focused Outcomes
 
@@ -82,18 +82,36 @@ Event-log schema for future supervised labels is documented in
 
 ## Repository Workflow
 
-1. Fetch telemetry data from ThingsBoard using scripts in `scripts/`.
-2. Run deterministic cleaning/preprocessing to generate model inputs.
-3. Run data-quality audit + feature diagnostics.
-4. Use curated daily features for model training and anomaly logic.
-5. Generate stakeholder-facing KPI and alert outputs.
+1. Fetch telemetry data from ThingsBoard (`scripts/1_fetch/`).
+2. Organize into tiered inverter files (`scripts/2_organize/`).
+3. Run deterministic cleaning/preprocessing (`scripts/3_preprocess/`).
+4. Run data-quality audit + feature diagnostics (`scripts/4_audit/`).
+5. Run EDA soiling signal analysis (`scripts/5_eda/`).
+6. Use curated daily features for model training and anomaly logic.
 
 ## Repository Structure
 
-- `data/`: raw exported telemetry CSVs.
-- `scripts/`: data fetchers and quality/EDA tooling.
-- `docs/`: engineering notes and review findings.
-- `artifacts/`: generated audit outputs (ignored by git).
+```
+.
+├── scripts/
+│   ├── core/               # Shared libraries (tb_client, daily_features)
+│   ├── 0_setup/            # Prerequisites (JWT auth)
+│   ├── 1_fetch/            # Data collection from ThingsBoard
+│   ├── 2_organize/         # Tier splitting
+│   ├── 3_preprocess/       # Cleaning & daily feature building
+│   ├── 4_audit/            # Quality validation
+│   ├── 5_eda/              # Exploratory data analysis
+│   └── utils/              # One-off investigation scripts
+├── docs/
+│   ├── README.md           # Pipeline entry point
+│   ├── pipeline/           # Step-by-step replication guides (01-05)
+│   ├── reference/          # Data dictionary, domain context, interpretation
+│   ├── planning/           # Research plans & methodology
+│   ├── archive/            # Historical docs
+│   └── templates/          # Event log templates
+├── data/                   # Raw exported telemetry CSVs (git-ignored)
+└── artifacts/              # Generated outputs (git-ignored)
+```
 
 ## Environment Configuration
 
@@ -110,7 +128,7 @@ Additional optional controls:
 Run:
 
 ```bash
-python scripts/data_quality_audit.py --data-dir data --out-dir artifacts/audit
+python scripts/4_audit/audit.py --data-dir data --out-dir artifacts/audit
 ```
 
 Outputs (under `artifacts/audit/`):
@@ -131,7 +149,7 @@ Plots (if `matplotlib` is installed):
 Run:
 
 ```bash
-python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocessed
+python scripts/3_preprocess/preprocess.py --data-dir data --out-dir artifacts/preprocessed
 ```
 
 Outputs (under `artifacts/preprocessed/`):
@@ -182,10 +200,10 @@ Important interpretation note:
 - Keep raw CSV exports out of git by default (`data/*.csv` ignored).
 - Prefer reproducible scripts over manual spreadsheet edits.
 - Treat raw exports as immutable and write processed outputs to separate locations.
-- See `docs/script_and_data_review.md` for current script/data risk findings.
+- See `docs/archive/script_and_data_review.md` for current script/data risk findings.
 
 ## Immediate Next Steps
 
-1. Run `scripts/data_preprocess.py` and review `artifacts/preprocessed/preprocessing_summary.md`.
-2. Run `scripts/data_quality_audit.py` and review `artifacts/audit/quality_summary.md`.
+1. Run `scripts/3_preprocess/preprocess.py` and review `artifacts/preprocessed/preprocessing_summary.md`.
+2. Run `scripts/4_audit/audit.py` and review `artifacts/audit/quality_summary.md`.
 3. Build training targets from `artifacts/preprocessed/daily_model_input.csv`.

@@ -7,13 +7,25 @@ This guide reproduces deterministic cleaning and daily feature assembly.
 Default run:
 
 ```bash
-python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocessed
+python scripts/3_preprocess/preprocess.py --data-dir data --out-dir artifacts/preprocessed
 ```
 
 Optional overlap trim:
 
 ```bash
-python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocessed --trim-to-overlap
+python scripts/3_preprocess/preprocess.py --data-dir data --out-dir artifacts/preprocessed --trim-to-overlap
+```
+
+Physical-PR options (defaults shown):
+
+```bash
+python scripts/3_preprocess/preprocess.py \
+  --inverter-capacity-kw 330 \
+  --plant-inverter-count 34 \
+  --runtime-min-hours 6 \
+  --runtime-max-hours 18 \
+  --runtime-csv data/time_series_chart_time_series_chart.csv \
+  --disable-new-source-if-clipped-pct 5
 ```
 
 ## Input Resolution Rules
@@ -32,6 +44,14 @@ python scripts/data_preprocess.py --data-dir data --out-dir artifacts/preprocess
    - `data/irradiance_2025_to_current_10min_none_std.csv`
 
 If Solcast files are absent, preprocessing continues without those columns.
+
+5. Per-inverter daily generation (optional):
+   - `data/inverters_daily_gen_2025_to_current_none_si.csv`
+6. Plant average solar radiation (optional):
+   - `data/plant_avg_irradiance_2025_to_current_none_si.csv`
+
+If the new telemetry files (5, 6) are absent, preprocessing continues without
+those columns. No existing features are affected.
 
 ## Cleaning Logic Implemented
 
@@ -61,6 +81,24 @@ Generation (`clean_generation`):
   - fallback `daily_generation_j_max`
 - Add `generation_intraday_spread_j`
 
+Inverter daily generation (`clean_inverter_daily_gen`, optional):
+
+- Parse and deduplicate by `Timestamp`
+- Reject negatives only (`< 0` -> NaN); no destructive upper clipping
+- Aggregate per inverter/day with `last`, `max`, `p99`
+- Daily selection rule: use `max`, unless `max > 1.25 * p99`, then use `p99`
+- Post-aggregation outlier fence per inverter: `Q3 + 3*IQR` on selected daily values
+- Convert kWh to Joules (`* 3,600,000`)
+- Output columns: `{inv_label}_daily_gen_j`
+- Audit export: `artifacts/preprocessed/inverter_daily_gen_audit.csv`
+
+Plant average irradiance (`clean_plant_avg_irradiance`, optional):
+
+- Parse and deduplicate by `Timestamp`
+- Group by day, take last reading (end-of-day = daily average)
+- Invalid values to NaN: `< 0` or `> 1500 W/m^2`
+- Output column: `plant_avg_irradiance_wm2`
+
 ## Daily Feature Assembly
 
 `build_daily_model_table` merges daily aggregates and computes:
@@ -72,10 +110,25 @@ Generation (`clean_generation`):
 - Quality flags (`flag_*`)
 - Transfer readiness (`transfer_quality_score`, `transfer_quality_tier`, `cross_plant_inference_ready`)
 - Common overlap marker (`in_common_overlap`)
+- Per-inverter daily generation (`{inv}_daily_gen_j`, `subset_daily_gen_j`, `subset_daily_gen_kwh`) — if new telemetry is present
+- Plant average irradiance (`plant_avg_irradiance_wm2`) — if new telemetry is present
+- Runtime merge (`runtime_h`, `runtime_source`) using runtime CSV first, Solcast daylight fallback second
+- Physical irradiation (`irradiation_kwh_m2 = plant_avg_irradiance_wm2 * runtime_h / 1000`)
+- Physical PR fields:
+  - `subset_pr_physical_raw`, `subset_pr_physical_outlier`, `subset_pr_physical_interp`
+  - `plant_pr_physical_raw`, `plant_pr_physical_outlier`
+- Backward-compatible aliases:
+  - `gen_irr_ratio` = `subset_pr_physical_raw`
+  - `gen_irr_ratio_smoothed` = 7-day median of `gen_irr_ratio`
+- Power at reference irradiance (`power_at_ref_irradiance_w`, tier variants) — from existing active power matched with on-site irradiance at the dataset median level
+- New-source performance loss proxy (`new_normalized_output`, `new_rolling_clean_baseline`, `new_performance_loss_pct_proxy`, `new_perf_loss_rate_14d_pct_per_day`, `new_normalized_output_14d_median`) — same pipeline as old-source but now built from physical PR alias
+- New-source cycle deviation (`new_cycle_id`, `new_soiling_index_x`, `new_cycle_max_x`, `new_cycle_deviation_pct`) — cycle-aware deviation using `gen_irr_ratio` directly
 
 Important interpretation:
 
 - `performance_loss_pct_proxy` is an all-cause performance deficit proxy, not pure soiling truth.
+- `gen_irr_ratio` is now a physical PR alias: `subset_daily_gen_kwh / (subset_capacity_kw * irradiation_kwh_m2)`.
+- `power_at_ref_irradiance_w` controls for irradiance variation by extracting active power only when irradiance is near the dataset median (+/-15%).
 
 ## Outputs
 
