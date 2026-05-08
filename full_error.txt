@@ -1,0 +1,110 @@
+﻿python : 00:06:15  INFO      Loaded 348 rows (2025-01-01 \u2192 2026-02-05), 11 training-ready (HQ + 0 flags)
+At line:1 char:1
++ python scripts/5_eda/soiling_signals.py 2> error.log
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (00:06:15  INFO ... (HQ + 0 flags):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+00:06:15  INFO      Starting parallel pipeline for new telemetry metrics...
+00:06:15  INFO      \u2500\u2500 Signal 1: Sawtooth detection \u2500\u2500
+00:06:16  INFO      Saved s1_loss_proxy_timeseries.png
+00:06:17  INFO      Saved s1_per_inverter_output.png
+00:06:17  INFO      Saved s1_cycle_deviation.png
+00:06:17  INFO      Saved s1_dryspell_slopes.png
+00:06:17  INFO      Signal 1 verdict: FAIL ù 0 dry spells analysed. Median soiling rate = +0.000 %/day (IQR +0.000 to +0.000). 0% of spells have positive slope (soiling accumulation).
+00:06:17  INFO      \u2500\u2500 Signal 2: PM/dust correlation \u2500\u2500
+00:06:17  INFO      Saved s2_pm10_scatter_panels.png
+00:06:18  INFO      Saved s2_top_predictors_vs_deviation.png
+00:06:18  INFO      Saved s2_feature_heatmap.png
+00:06:19  INFO      Signal 2 verdict: PASS ù Strongest raw predictor of cycle deviation: days_since_last_rain (r=+0.881). Best partial correlation (deconfounded) = +0.860. Within-cycle PM10-rate r = 
++nan (n=0 cycles).
+00:06:19  INFO      \u2500\u2500 Signal 3: Rain recovery \u2500\u2500
+M:\Documents\Projects\MAGICBIT\Soling Loss Predictions\scripts\5_eda\soiling_signals.py:598: UserWarning: No artists with labels found to put in legend.  Note that artists whose label start with an 
+underscore are ignored when legend() is called with no argument.
+  ax.legend(fontsize=8)
+00:06:19  INFO      Saved s3_rain_event_study.png
+M:\Documents\Projects\MAGICBIT\Soling Loss Predictions\scripts\5_eda\soiling_signals.py:630: UserWarning: No artists with labels found to put in legend.  Note that artists whose label start with an 
+underscore are ignored when legend() is called with no argument.
+  ax.legend(fontsize=8)
+00:06:19  INFO      Saved s3_dryspell_start_end.png
+00:06:19  INFO      Saved s3_recovery_vs_precipitation.png
+00:06:19  INFO      Saved s3_rain_event_study_seasonal.png
+00:06:19  INFO      Signal 3 verdict: FAIL ù Event-study Wilcoxon p = 1.0000 (day+3..+5 vs day 0). Dry-spell accumulation p = 1.0000 (end > start). n_rain=0, n_spells=0.
+00:06:19  INFO      \u2500\u2500 Clear-Sky Soiling Analysis \u2500\u2500
+00:06:19  INFO      CSA days: 2 / 11 HQ
+00:06:19  INFO      Saved c1_clear_sky_loss_timeseries.png
+00:06:19  INFO      Saved c2_clean_vs_all_correlations.png
+00:06:20  INFO      Saved c3_clean_scatter_matrix.png
+00:06:20  INFO      Parallel pipeline plotting complete.
+00:06:20  INFO      \u2500\u2500 Signal 1: Sawtooth detection \u2500\u2500
+00:06:21  INFO      Saved s1_loss_proxy_timeseries.png
+00:06:22  INFO      Saved s1_per_inverter_output.png
+00:06:22  INFO      Saved s1_cycle_deviation.png
+00:06:22  INFO      Saved s1_dryspell_slopes.png
+00:06:22  INFO      Signal 1 verdict: FAIL ù 0 dry spells analysed. Median soiling rate = +0.000 %/day (IQR +0.000 to +0.000). 0% of spells have positive slope (soiling accumulation).
+00:06:22  INFO      \u2500\u2500 Signal 2: PM/dust correlation \u2500\u2500
+00:06:23  INFO      Saved s2_pm10_scatter_panels.png
+00:06:23  INFO      Saved s2_top_predictors_vs_deviation.png
+00:06:24  INFO      Saved s2_feature_heatmap.png
+00:06:24  INFO      Signal 2 verdict: FAIL ù Strongest raw predictor of cycle deviation: days_since_last_rain (r=+nan). Best partial correlation (deconfounded) = +0.000. Within-cycle PM10-rate r = +nan 
+(n=0 cycles).
+00:06:24  INFO      \u2500\u2500 Signal 3: Rain recovery \u2500\u2500
+M:\Documents\Projects\MAGICBIT\Soling Loss Predictions\scripts\5_eda\soiling_signals.py:598: UserWarning: No artists with labels found to put in legend.  Note that artists whose label start with an 
+underscore are ignored when legend() is called with no argument.
+  ax.legend(fontsize=8)
+00:06:24  INFO      Saved s3_rain_event_study.png
+M:\Documents\Projects\MAGICBIT\Soling Loss Predictions\scripts\5_eda\soiling_signals.py:630: UserWarning: No artists with labels found to put in legend.  Note that artists whose label start with an 
+underscore are ignored when legend() is called with no argument.
+  ax.legend(fontsize=8)
+00:06:24  INFO      Saved s3_dryspell_start_end.png
+00:06:24  INFO      Saved s3_recovery_vs_precipitation.png
+00:06:24  INFO      Saved s3_rain_event_study_seasonal.png
+00:06:24  INFO      Signal 3 verdict: FAIL ù Event-study Wilcoxon p = 1.0000 (day+3..+5 vs day 0). Dry-spell accumulation p = 1.0000 (end > start). n_rain=0, n_spells=0.
+00:06:24  INFO      \u2500\u2500 Supporting analyses \u2500\u2500
+00:06:25  INFO      Saved s4_univariate_distributions.png
+M:\Documents\Projects\MAGICBIT\Soling Loss Predictions\scripts\5_eda\soiling_signals.py:803: ConstantInputWarning: An input array is constant; the correlation coefficient is not defined.
+  r_pv, _ = stats.pearsonr(pair["pvlib"], pair["obs"])
+00:06:26  INFO      Saved s4_pvlib_vs_observed.png
+00:06:26  INFO      Saved s4_sensor_dirt_check.png
+00:06:26  INFO      Saved s4_tier_validation.png
+00:06:26  INFO      Saved s4_seasonal_boxplots.png
+00:06:27  INFO      Saved s4_quality_gating.png
+00:06:27  INFO      Saved s5_domain_soiling_index.png
+00:06:27  INFO      Saved s5_dspi_correlation_profile.png
+00:06:27  INFO      \u2500\u2500 Clear-Sky Soiling Analysis \u2500\u2500
+00:06:27  INFO      CSA days: 2 / 11 HQ
+00:06:28  INFO      Saved c1_clear_sky_loss_timeseries.png
+00:06:28  INFO      Saved c2_clean_vs_all_correlations.png
+00:06:28  INFO      Saved c3_clean_scatter_matrix.png
+00:06:28  INFO      \u2500\u2500 Data quality: irradiance vs generation \u2500\u2500
+00:06:28  INFO      Saved dq1_irradiance_vs_generation_timeseries.png
+00:06:29  INFO      Saved dq1_irradiance_vs_generation.png
+00:06:29  INFO      DQ1 done: on-site r=0.064, solcast-peak r=-0.072, solcast-peak-vs-fullgen r=0.515, zero-gen-on-sunny=7
+00:06:29  INFO      \u2500\u2500 DQ2: Daily generation validation (asset-aligned + physical irradiation) \u2500\u2500
+00:06:30  INFO      Saved dq2_daily_gen_validation_timeseries.png
+00:06:30  INFO      Saved dq2_daily_gen_validation.png
+00:06:30  INFO      DQ2 done: old-vs-new r=0.327, new-vs-irradiation r=0.759
+00:06:30  INFO      \u2500\u2500 DQ3: Physical PR diagnostics \u2500\u2500
+00:06:31  INFO      Saved dq3_gen_irr_ratio_timeseries.png
+00:06:31  INFO      Saved dq3_gen_irr_ratio.png
+00:06:31  INFO      DQ3 done: median raw PR=14.2201, outliers=241
+00:06:31  INFO      \u2500\u2500 DQ4: Power at reference irradiance \u2500\u2500
+00:06:32  INFO      Saved dq4_power_at_ref_irradiance.png
+00:06:32  INFO      DQ4 done: 272 days, median power=1138670 W, PM predictor=unknown
+00:06:32  INFO      Saved dq5_old_vs_new_timeseries.png
+Traceback (most recent call last):
+  File "M:\Documents\Projects\MAGICBIT\Soling Loss Predictions\scripts\5_eda\soiling_signals.py", line 3460, in <module>
+    main()
+    ~~~~^^
+  File "M:\Documents\Projects\MAGICBIT\Soling Loss Predictions\scripts\5_eda\soiling_signals.py", line 3384, in main
+    dq5_results = plot_old_vs_new_source_comparison(df, plots_dir)
+  File "M:\Documents\Projects\MAGICBIT\Soling Loss Predictions\scripts\5_eda\soiling_signals.py", line 2744, in plot_old_vs_new_source_comparison
+    r_val = pair[old_loss].corr(pair[new_loss])
+  File "C:\Users\Asus\AppData\Roaming\Python\Python313\site-packages\pandas\core\frame.py", line 11051, in corr
+    if method == "pearson":
+       ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Asus\AppData\Roaming\Python\Python313\site-packages\pandas\core\generic.py", line 1577, in __nonzero__
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: The truth value of a DataFrame is ambiguous. Use a.empty, a.bool(), a.item(), a.any() or a.all().

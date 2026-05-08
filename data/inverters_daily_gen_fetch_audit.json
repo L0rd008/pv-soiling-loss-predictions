@@ -1,0 +1,77 @@
+{
+  "generated_at_local": "2026-03-08T19:10:19.257570+05:30",
+  "warning_threshold_kwh": 1000.0,
+  "global": {
+    "total_points": 956698,
+    "parse_failures": 0,
+    "negative_dropped_points": 0,
+    "above_warning_points": 743862,
+    "above_warning_pct": 77.7531
+  },
+  "per_inverter": {
+    "B1-04": {
+      "total_points": 75154,
+      "parse_failures": 0,
+      "negative_dropped_points": 0,
+      "above_warning_points": 62691,
+      "min_value_kwh": 0.0,
+      "max_value_kwh": 82497769.0
+    },
+    "B1-08": {
+      "total_points": 75174,
+      "parse_failures": 0,
+      "negative_dropped_points": 0,
+      "above_warning_points": 62654,
+      "min_value_kwh": 0.0,
+      "max_value_kwh": 1749667635.0
+    },
+    "B1-13": {
+      "total_points": 155059,
+      "parse_failures": 0,
+      "negative_dropped_points": 0,
+      "above_warning_points": 129047,
+      "min_value_kwh": 0.0,
+      "max_value_kwh": 83067068.0
+    },
+    "B1-17": {
+      "total_points": 155096,
+      "parse_failures": 0,
+      "negative_dropped_points": 0,
+      "above_warning_points": 129294,
+      "min_value_kwh": 0.0,
+      "max_value_kwh": 82544710.0
+    },
+    "B2-04": {
+      "total_points": 75078,
+      "parse_failures": 0,
+      "negative_dropped_points": 0,
+      "above_warning_points": 62714,
+      "min_value_kwh": 0.0,
+      "max_value_kwh": 53874373.0
+    },
+    "B2-08": {
+      "total_points": 133913,
+      "parse_failures": 0,
+      "negative_dropped_points": 0,
+      "above_warning_points": 94749,
+      "min_value_kwh": 0.0,
+      "max_value_kwh": 82254898.0
+    },
+    "B2-13": {
+      "total_points": 143660,
+      "parse_failures": 0,
+      "negative_dropped_points": 0,
+      "above_warning_points": 101361,
+      "min_value_kwh": 0.0,
+      "max_value_kwh": 85949794.0
+    },
+    "B2-17": {
+      "total_points": 143564,
+      "parse_failures": 0,
+      "negative_dropped_points": 0,
+      "above_warning_points": 101352,
+      "min_value_kwh": 0.0,
+      "max_value_kwh": 83665287.0
+    }
+  }
+}

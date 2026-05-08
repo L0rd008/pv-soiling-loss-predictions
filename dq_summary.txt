@@ -1,0 +1,81 @@
+--- Quality Gating ---
+{
+  "total_days": 348,
+  "hq_days": 185,
+  "hq_ratio_pct": 53.2,
+  "csa_days": 22,
+  "tier_distribution": {
+    "high": 293,
+    "medium": 33,
+    "low": 22
+  },
+  "flag_count_distribution": {
+    "0": 186,
+    "1": 111,
+    "2": 39,
+    "3": 12
+  },
+  "readiness_tier_distribution": {},
+  "individual_flag_prevalence": {
+    "flag_sensor_suspect_irradiance": {
+      "n_flagged": 12,
+      "pct_flagged": 3.45
+    },
+    "flag_coverage_gap": {
+      "n_flagged": 17,
+      "pct_flagged": 4.89
+    },
+    "flag_block_mismatch": {
+      "n_flagged": 41,
+      "pct_flagged": 11.78
+    },
+    "flag_low_output_high_irr": {
+      "n_flagged": 59,
+      "pct_flagged": 16.95
+    },
+    "flag_zero_output": {
+      "n_flagged": 17,
+      "pct_flagged": 4.89
+    },
+    "flag_zero_subset_gen": {
+      "n_flagged": 0,
+      "pct_flagged": 0.0
+    },
+    "flag_sensor_recalibrated": {
+      "n_flagged": 79,
+      "pct_flagged": 22.7
+    }
+  }
+}
+
+--- Feature Data Points (HQ days) ---
+t1_performance_loss_pct_proxy: (n=169, n_null=16)
+t2_performance_loss_pct_proxy: (n=169, n_null=16)
+precipitation_total_mm: (n=185, n_null=0)
+pm10_mean: (n=185, n_null=0)
+pm25_mean: (n=185, n_null=0)
+cycle_deviation_pct: (n=185, n_null=0)
+domain_soiling_daily: (n=185, n_null=0)
+domain_soiling_index: (n=185, n_null=0)
+t1_perf_loss_rate_14d_pct_per_day: (n=167, n_null=18)
+humidity_mean: (n=185, n_null=0)
+wind_speed_10m_mean: (n=185, n_null=0)
+air_temp_mean: (n=185, n_null=0)
+cloud_opacity_mean: (n=185, n_null=0)
+pvlib_soiling_ratio_hsu: (n=185, n_null=0)
+pvlib_soiling_loss_kimber: (n=185, n_null=0)
+pr_temperature_corrected: (n=169, n_null=16)
+tier_loss_correlation: (n=169, n_null=16)
+
+--- Signal 1 Daily Series (length) ---
+Total Dates in daily_series: 348
+t1_performance_loss_pct_proxy: valid=322, nulls=26
+cycle_deviation_pct: valid=335, nulls=13
+domain_soiling_index: valid=348, nulls=0
+precipitation_total_mm: valid=348, nulls=0
+rain_day: valid=348, nulls=0
+
+--- Summary of verdicts ---
+Signal 1: weak
+Signal 2: pass
+Signal 3: fail
