@@ -27,3 +27,8 @@ reports/private/
 *.pem
 *.key
 *.crt
+
+# Additional ignores added by agent
+*.txt
+!requirements.txt
+references/*.pdf
